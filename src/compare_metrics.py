@@ -1,0 +1,133 @@
+import argparse
+from pathlib import Path
+
+import pandas as pd
+
+# Default summary columns for the original ring / ambiguous-ring tasks.
+BASE_COLS = [
+    "run",
+    "teacher_forced_mse",
+    "rollout_mse_mean",
+    "rollout_angle_error_rad",
+    "prediction_horizon_steps",
+    "extras/fast_weight_norm_mean",
+    "extras/fast_drive_norm_mean",
+]
+
+# Task-specific columns emitted by the updated analyze.py for eight_arm_traj.
+EIGHT_ARM_COLS = [
+    "run",
+    # Generic losses
+    "teacher_forced_mse",
+    "rollout_mse_mean",
+    # Best behavioral / working-memory metrics
+    "eightarm_rollout/first_choice_exact_arm_acc",
+    "eightarm_rollout/valid_unvisited_choice_rate",
+    "eightarm_rollout/invalid_forced_reentry_rate",
+    "eightarm_rollout/invalid_choice_reentry_rate",
+    "eightarm_rollout/choice_departure_exact_arm_acc",
+    "eightarm_rollout/mse_choice",
+    "eightarm_rollout/position_acc_choice",
+    # Teacher-forced versions, useful for separating training failure from rollout failure
+    "eightarm_tf/first_choice_exact_arm_acc",
+    "eightarm_tf/valid_unvisited_choice_rate",
+    "eightarm_tf/invalid_forced_reentry_rate",
+    "eightarm_tf/invalid_choice_reentry_rate",
+    "eightarm_tf/choice_departure_exact_arm_acc",
+    "eightarm_tf/mse_choice",
+    "eightarm_tf/position_acc_choice",
+    # Optional phase-specific diagnostics
+    "eightarm_rollout/mse_forced",
+    "eightarm_rollout/mse_settle",
+    "eightarm_rollout/position_acc",
+    "eightarm_rollout/position_acc_forced",
+    "eightarm_rollout/position_acc_settle",
+    # Fast-weight diagnostics
+    "extras/fast_weight_norm_mean",
+    "extras/fast_drive_norm_mean",
+]
+
+
+def infer_run_name(path: str) -> str:
+    """
+    Infer a useful run label from a metrics.csv path.
+
+    Handles both:
+        data/runs/<run_name>/metrics.csv
+    and:
+        data/runs/<run_name>/analysis/metrics.csv
+    """
+    p = Path(path)
+
+    if p.name == "metrics.csv":
+        if p.parent.name == "analysis":
+            return p.parent.parent.name
+        return p.parent.name
+
+    return p.stem
+
+
+def load_metrics(path: str) -> dict:
+    df = pd.read_csv(path)
+
+    required = {"metric", "value"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{path} is missing required columns: {sorted(missing)}")
+
+    out = {row["metric"]: row["value"] for _, row in df.iterrows()}
+    out["run"] = infer_run_name(path)
+    return out
+
+
+def select_columns(df: pd.DataFrame, mode: str) -> list[str]:
+    if mode == "base":
+        desired = BASE_COLS
+    elif mode == "eight_arm":
+        desired = EIGHT_ARM_COLS
+    elif mode == "all":
+        desired = ["run"] + [c for c in df.columns if c != "run"]
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    return [c for c in desired if c in df.columns]
+
+
+def main(args):
+    rows = [load_metrics(path) for path in args.metrics]
+    df = pd.DataFrame(rows)
+
+    cols = select_columns(df, args.mode)
+    df = df[cols]
+
+    # Stable, readable ordering for settle sweeps if run names contain s0/s2/s5/s10.
+    if args.sort:
+        df = df.sort_values("run")
+
+    print(df.to_string(index=False))
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out, index=False)
+    print(f"\nSaved comparison to {out}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("metrics", nargs="+", help="Paths to metrics.csv files.")
+    p.add_argument("--out", default="data/runs/comparison.csv")
+    p.add_argument(
+        "--mode",
+        choices=["base", "eight_arm", "all"],
+        default="base",
+        help=(
+            "Which metric subset to write. Use eight_arm for eight_arm_traj, "
+            "all to keep every metric emitted by analyze.py."
+        ),
+    )
+    p.add_argument("--sort", action="store_true", help="Sort rows by run name.")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    main(parse_args())
