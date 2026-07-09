@@ -528,6 +528,7 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         forced_departure_weight: float = 3.0,
         choice_departure_weight: float = 10.0,
         arm_choice_weight: float = 50.0,
+        routing_weight: float = 20.0,
         seed: int = 0,
     ):
         super().__init__()
@@ -556,6 +557,7 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         self.forced_departure_weight = float(forced_departure_weight)
         self.choice_departure_weight = float(choice_departure_weight)
         self.arm_choice_weight = float(arm_choice_weight)
+        self.routing_weight = float(routing_weight)
 
         self.center_idx = 0
         self.n_pos = 1 + n_arms * arm_len
@@ -816,8 +818,20 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         weights[forced_departure, :] = self.forced_departure_weight
         weights[choice_departure, :] = self.choice_departure_weight
 
+        # Routing transition: center(with chosen-arm cue) -> first spatial position on that arm.
+        # This is the step that was collapsing to center in autonomous rollout.  Upweight
+        # only the spatial bump channels so the model is explicitly trained to route the
+        # bump out of center once an arm-choice cue is available.
+        x_arm_choice_active = (
+            self.x[:, :, self.arm_choice_start : self.arm_choice_end].sum(dim=-1) > 0
+        )
+        routing_transition = center_to_arm & x_arm_choice_active
+        weights[routing_transition, : self.n_pos] = self.routing_weight
+
         # The arm-choice head is the direct supervision for the branch decision.
-        arm_choice_active = self.y[:, :, self.arm_choice_start : self.arm_choice_end].sum(dim=-1) > 0
+        arm_choice_active = (
+            self.y[:, :, self.arm_choice_start : self.arm_choice_end].sum(dim=-1) > 0
+        )
         weights[arm_choice_active, self.arm_choice_start : self.arm_choice_end] = self.arm_choice_weight
 
         return weights
@@ -892,6 +906,7 @@ def build_dataset(args, n_samples, seed):
             forced_departure_weight=getattr(args, "forced_departure_weight", 3.0),
             choice_departure_weight=getattr(args, "choice_departure_weight", 10.0),
             arm_choice_weight=getattr(args, "arm_choice_weight", 50.0),
+            routing_weight=getattr(args, "routing_weight", 20.0),
             seed=seed,
         )
 

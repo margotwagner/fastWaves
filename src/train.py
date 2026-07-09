@@ -210,6 +210,7 @@ def parse_args():
     p.add_argument("--forced-departure-weight", type=float, default=3.0)
     p.add_argument("--choice-departure-weight", type=float, default=10.0)
     p.add_argument("--arm-choice-weight", type=float, default=50.0)
+    p.add_argument("--routing-weight", type=float, default=20.0)
 
     p.add_argument("--n-space", type=int, default=32)
     p.add_argument("--seq-len", type=int, default=40)
