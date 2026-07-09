@@ -580,7 +580,12 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
 
         self.pos_dist = self._make_radial_graph_distance_matrix()
 
-        self.visit_len = 1 + arm_len + max(0, reward_hold_steps - 1) + (arm_len - 1) + 1
+        # Per arm visit frames:
+        #   center(no action) -> center(action cue) -> outbound depths -> optional reward holds
+        #   -> inbound depths -> center(no action)
+        # The extra center(action cue) frame lets autonomous rollout use the predicted arm-choice
+        # channel as an input before the spatial bump has to leave the center.
+        self.visit_len = 2 + arm_len + max(0, reward_hold_steps - 1) + (arm_len - 1) + 1
         natural_frames = (n_arms * self.visit_len) + settle_steps
         self.natural_seq_len = natural_frames - 1
 
@@ -724,13 +729,26 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         return frame
 
     def _visit_frames(self, arm: int, phase: str) -> list[torch.Tensor]:
+        # Two center frames are intentional:
+        #   1. center with no arm-choice cue: the memory/choice state.
+        #   2. center with arm-choice cue: the action-conditioned routing state.
+        #
+        # In teacher forcing, frame 2 teaches "given chosen arm k at center, route the
+        # spatial bump into arm k." In rollout, frame 2 is generated from frame 1,
+        # so the network must still choose the arm itself.
         frames = [
             self._make_frame(
                 pos_idx=self.center_idx,
                 phase=phase,
                 direction="center",
                 arm_choice=None,
-            )
+            ),
+            self._make_frame(
+                pos_idx=self.center_idx,
+                phase=phase,
+                direction="center",
+                arm_choice=arm,
+            ),
         ]
 
         for depth in range(self.arm_len):

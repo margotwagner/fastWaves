@@ -233,6 +233,103 @@ def eight_arm_traj_metrics(yhat, x, y, dataset, prefix="eightarm"):
                 action_mse, choice_departure_mask
             )
 
+            # For the action-conditioned eight-arm task, the old "choice departure"
+            # event splits into two distinct transitions:
+            #   1) action selection: center(no arm cue) -> center(with arm cue)
+            #   2) spatial routing: center(with arm cue) -> first position on that arm
+            # These metrics separate memory/arm selection from action-conditioned
+            # spatial routing. For the older non-action-conditioned task, these masks
+            # will simply be empty or near-empty.
+            x_action_active = x[:, :, a0:a1].sum(dim=-1) > 0.5
+
+            action_selection_mask = (
+                (x_pos == dataset.center_idx)
+                & (~x_action_active)
+                & (true_pos == dataset.center_idx)
+                & true_action_active
+                & choice_mask
+            )
+
+            routing_mask = (
+                (x_pos == dataset.center_idx)
+                & x_action_active
+                & choice_mask
+                & (true_arm >= 0)
+            )
+
+            metrics[f"{prefix}/arm_choice_head_acc_action_selection"] = _masked_mean_tensor(
+                action_exact.float(), action_selection_mask
+            )
+            metrics[f"{prefix}/arm_choice_head_mse_action_selection"] = _masked_mean_tensor(
+                action_mse, action_selection_mask
+            )
+            metrics[f"{prefix}/arm_choice_head_acc_routing"] = _masked_mean_tensor(
+                action_exact.float(), routing_mask
+            )
+            metrics[f"{prefix}/arm_choice_head_mse_routing"] = _masked_mean_tensor(
+                action_mse, routing_mask
+            )
+
+            def event_stats(mask, decoded_pred_arm, name):
+                exact = []
+                first_exact = []
+                valid = []
+                invalid_forced_evt = []
+                invalid_choice_evt = []
+                no_arm = []
+
+                for b in range(B):
+                    ts = torch.where(mask[b])[0]
+                    forced_set = set(int(a.item()) for a in forced_orders[b])
+                    choice_list = [int(a.item()) for a in choice_orders[b]]
+
+                    for j, t in enumerate(ts.tolist()):
+                        pa = int(decoded_pred_arm[b, t].item())
+
+                        if name == "routing":
+                            ta = int(true_arm[b, t].item())
+                        else:
+                            ta = int(true_action_arm[b, t].item())
+
+                        already_choice_set = set(choice_list[:j])
+                        remaining_choice_set = set(choice_list[j:])
+
+                        exact.append(float(pa == ta))
+                        if j == 0:
+                            first_exact.append(float(pa == ta))
+                        valid.append(float(pa in remaining_choice_set))
+                        invalid_forced_evt.append(float(pa in forced_set))
+                        invalid_choice_evt.append(float(pa in already_choice_set or pa in forced_set))
+                        no_arm.append(float(pa < 0))
+
+                metrics[f"{prefix}/{name}_exact_arm_acc"] = _mean_or_nan(exact)
+                metrics[f"{prefix}/{name}_first_choice_exact_arm_acc"] = _mean_or_nan(first_exact)
+                metrics[f"{prefix}/{name}_valid_unvisited_rate"] = _mean_or_nan(valid)
+                metrics[f"{prefix}/{name}_invalid_forced_reentry_rate"] = _mean_or_nan(invalid_forced_evt)
+                metrics[f"{prefix}/{name}_invalid_choice_reentry_rate"] = _mean_or_nan(invalid_choice_evt)
+                metrics[f"{prefix}/{name}_no_arm_rate"] = _mean_or_nan(no_arm)
+                metrics[f"{prefix}/n_{name}_events"] = float(len(exact))
+
+            event_stats(
+                action_selection_mask,
+                pred_action_arm,
+                "action_selection",
+            )
+            event_stats(
+                routing_mask,
+                pred_arm,
+                "routing",
+            )
+
+            # A useful bridge diagnostic: at the routing step, does the spatial
+            # prediction agree with the arm-choice head prediction? This can reveal
+            # whether the model has selected an arm but fails to route the bump.
+            pred_action_active_arm = pred_action_arm
+            spatial_action_agree = pred_arm.eq(pred_action_active_arm) & (pred_arm >= 0)
+            metrics[f"{prefix}/routing_spatial_matches_arm_head_rate"] = _masked_mean_tensor(
+                spatial_action_agree.float(), routing_mask
+            )
+
     return metrics
 
 
