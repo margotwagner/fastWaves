@@ -325,9 +325,37 @@ def eight_arm_traj_metrics(yhat, x, y, dataset, prefix="eightarm"):
             # prediction agree with the arm-choice head prediction? This can reveal
             # whether the model has selected an arm but fails to route the bump.
             pred_action_active_arm = pred_action_arm
-            spatial_action_agree = pred_arm.eq(pred_action_active_arm) & (pred_arm >= 0)
+
+            # End-to-end action-to-routing consistency:
+            # At a routing event, did the spatial prediction enter the same arm
+            # selected by the model's arm-choice head? No-arm predictions count
+            # as failures in this primary metric.
+            spatial_departed = pred_arm >= 0
+            spatial_action_agree = pred_arm.eq(pred_action_active_arm) & spatial_departed
             metrics[f"{prefix}/routing_spatial_matches_arm_head_rate"] = _masked_mean_tensor(
                 spatial_action_agree.float(), routing_mask
+            )
+
+            # Conditional consistency:
+            # Among routing events where the spatial bump actually entered an arm,
+            # how often did it enter the arm selected by the action head?
+            departed_routing_mask = routing_mask & spatial_departed
+            metrics[
+                f"{prefix}/routing_spatial_matches_arm_head_given_departure_rate"
+            ] = _masked_mean_tensor(
+                pred_arm.eq(pred_action_active_arm).float(),
+                departed_routing_mask,
+            )
+
+            # Target-grounded end-to-end routing success:
+            # Did both the action head and spatial prediction agree with the
+            # ground-truth chosen arm at the routing transition?
+            action_matches_target = pred_action_active_arm.eq(true_arm)
+            spatial_matches_target = pred_arm.eq(true_arm) & spatial_departed
+            end_to_end_correct = action_matches_target & spatial_matches_target
+            metrics[f"{prefix}/action_to_target_routing_success_rate"] = _masked_mean_tensor(
+                end_to_end_correct.float(),
+                routing_mask,
             )
 
     return metrics
