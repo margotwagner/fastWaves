@@ -68,20 +68,26 @@ def _masked_mean_tensor(values, mask):
     return values[mask].mean().item()
 
 
-def eight_arm_traj_metrics(yhat, x, y, dataset, prefix="eightarm"):
-    """
-    Task-specific metrics for EightArmTrajectoryDataset.
+def eight_arm_traj_metrics(
+    yhat,
+    x,
+    y,
+    dataset,
+    prefix="eightarm",
+    rollout_mode=False,
+):
+    """Task-specific metrics for the eight-arm trajectory tasks.
 
-    yhat, x, y: [B, T, N]
-    dataset must expose the metadata produced by EightArmTrajectoryDataset:
-        n_pos, arm_len, n_arms, cue_* indices, forced_orders, choice_orders.
+    Target-relative MSE/accuracy metrics are retained for diagnostics. For the
+    action-conditioned bump task, the primary behavioral metrics track the
+    model's selected arms and, in rollout mode, update visited history from the
+    arms that the model actually enters spatially.
     """
-    B, T, N = y.shape
+    B, T, _ = y.shape
     n_pos = int(dataset.n_pos)
     arm_len = int(dataset.arm_len)
     n_arms = int(dataset.n_arms)
 
-    # Decode the discrete maze position from the position channels only.
     pred_pos = yhat[:, :, :n_pos].argmax(dim=-1)
     true_pos = y[:, :, :n_pos].argmax(dim=-1)
     x_pos = x[:, :, :n_pos].argmax(dim=-1)
@@ -89,13 +95,10 @@ def eight_arm_traj_metrics(yhat, x, y, dataset, prefix="eightarm"):
     pos_correct = pred_pos.eq(true_pos)
     mse_per_tn = F.mse_loss(yhat, y, reduction="none").mean(dim=-1)
 
-    # Masks based on the target state's phase cues.
     forced_mask = y[:, :, dataset.cue_forced] > 0.5
     choice_mask = y[:, :, dataset.cue_choice] > 0.5
     settle_mask = y[:, :, dataset.cue_settle] > 0.5
     reward_mask = y[:, :, dataset.cue_reward] > 0.5
-    outbound_mask = y[:, :, dataset.cue_outbound] > 0.5
-    inbound_mask = y[:, :, dataset.cue_inbound] > 0.5
     center_mask = y[:, :, dataset.cue_center] > 0.5
 
     metrics = {
@@ -103,16 +106,18 @@ def eight_arm_traj_metrics(yhat, x, y, dataset, prefix="eightarm"):
         f"{prefix}/position_acc_forced": _masked_mean_tensor(
             pos_correct.float(), forced_mask
         ),
-        f"{prefix}/position_acc_choice": _masked_mean_tensor(
+        f"{prefix}/position_acc_choice_target_relative": _masked_mean_tensor(
             pos_correct.float(), choice_mask
         ),
         f"{prefix}/position_acc_settle": _masked_mean_tensor(
             pos_correct.float(), settle_mask
         ),
         f"{prefix}/mse_forced": _masked_mean_tensor(mse_per_tn, forced_mask),
-        f"{prefix}/mse_choice": _masked_mean_tensor(mse_per_tn, choice_mask),
+        f"{prefix}/mse_choice_target_relative": _masked_mean_tensor(
+            mse_per_tn, choice_mask
+        ),
         f"{prefix}/mse_settle": _masked_mean_tensor(mse_per_tn, settle_mask),
-        f"{prefix}/reward_site_acc": _masked_mean_tensor(
+        f"{prefix}/reward_site_acc_target_relative": _masked_mean_tensor(
             pos_correct.float(), reward_mask
         ),
         f"{prefix}/center_state_acc": _masked_mean_tensor(
@@ -120,7 +125,6 @@ def eight_arm_traj_metrics(yhat, x, y, dataset, prefix="eightarm"):
         ),
     }
 
-    # Phase-cue classification accuracy.
     phase_cues = torch.tensor(
         [dataset.cue_forced, dataset.cue_choice, dataset.cue_settle],
         device=y.device,
@@ -128,7 +132,9 @@ def eight_arm_traj_metrics(yhat, x, y, dataset, prefix="eightarm"):
     )
     pred_phase = yhat[:, :, phase_cues].argmax(dim=-1)
     true_phase = y[:, :, phase_cues].argmax(dim=-1)
-    metrics[f"{prefix}/phase_cue_acc"] = pred_phase.eq(true_phase).float().mean().item()
+    metrics[f"{prefix}/phase_cue_acc"] = (
+        pred_phase.eq(true_phase).float().mean().item()
+    )
 
     direction_cues = torch.tensor(
         [
@@ -142,9 +148,10 @@ def eight_arm_traj_metrics(yhat, x, y, dataset, prefix="eightarm"):
     )
     pred_dir = yhat[:, :, direction_cues].argmax(dim=-1)
     true_dir = y[:, :, direction_cues].argmax(dim=-1)
-    metrics[f"{prefix}/direction_cue_acc"] = pred_dir.eq(true_dir).float().mean().item()
+    metrics[f"{prefix}/direction_cue_acc"] = (
+        pred_dir.eq(true_dir).float().mean().item()
+    )
 
-    # Convert position index to arm index. Center has arm = -1.
     def pos_to_arm(pos):
         arm = torch.full_like(pos, -1)
         is_arm = (pos >= 1) & (pos < n_pos)
@@ -154,237 +161,234 @@ def eight_arm_traj_metrics(yhat, x, y, dataset, prefix="eightarm"):
     pred_arm = pos_to_arm(pred_pos)
     true_arm = pos_to_arm(true_pos)
 
-    # Choice departures are the important memory-dependent moments:
-    # current input is center, target next position is an arm position, target phase is choice.
-    choice_departure_mask = (
-        (x_pos == dataset.center_idx) & choice_mask & (true_arm >= 0)
+    # Older trajectory task without an explicit action head.
+    if not (
+        hasattr(dataset, "arm_choice_start")
+        and hasattr(dataset, "arm_choice_end")
+        and int(dataset.arm_choice_end) <= yhat.shape[-1]
+    ):
+        choice_departure_mask = (
+            (x_pos == dataset.center_idx) & choice_mask & (true_arm >= 0)
+        )
+        exact = pred_arm.eq(true_arm)
+        departed = pred_arm >= 0
+        metrics[f"{prefix}/routing_exact_arm_acc"] = _masked_mean_tensor(
+            exact.float(), choice_departure_mask
+        )
+        metrics[f"{prefix}/routing_departure_rate"] = _masked_mean_tensor(
+            departed.float(), choice_departure_mask
+        )
+        return metrics
+
+    a0 = int(dataset.arm_choice_start)
+    a1 = int(dataset.arm_choice_end)
+    pred_action_arm = yhat[:, :, a0:a1].argmax(dim=-1)
+    true_action_arm = y[:, :, a0:a1].argmax(dim=-1)
+    true_action_active = y[:, :, a0:a1].sum(dim=-1) > 0.5
+    x_action_active = x[:, :, a0:a1].sum(dim=-1) > 0.5
+
+    if hasattr(dataset, "valid_choice_masks"):
+        valid_choice_masks = dataset.valid_choice_masks.to(y.device)
+        action_selection_mask = valid_choice_masks.sum(dim=-1) > 0.5
+    else:
+        action_selection_mask = (
+            (x_pos == dataset.center_idx)
+            & (~x_action_active)
+            & (true_pos == dataset.center_idx)
+            & true_action_active
+            & choice_mask
+        )
+        valid_choice_masks = None
+
+    routing_mask = (
+        (x_pos == dataset.center_idx)
+        & x_action_active
+        & choice_mask
+        & (true_arm >= 0)
     )
 
-    exact_departure = []
-    first_choice_exact = []
-    valid_unvisited = []
-    invalid_forced = []
-    invalid_choice_reentry = []
-    no_arm_departure = []
+    action_exact = pred_action_arm.eq(true_action_arm)
+    action_mse = F.mse_loss(
+        yhat[:, :, a0:a1], y[:, :, a0:a1], reduction="none"
+    ).mean(dim=-1)
+    spatial_departed = pred_arm >= 0
+    routing_exact = pred_arm.eq(true_arm) & spatial_departed
+
+    metrics[f"{prefix}/arm_choice_head_acc_all_active_target_relative"] = (
+        _masked_mean_tensor(action_exact.float(), true_action_active)
+    )
+    metrics[f"{prefix}/action_selection_exact_target_arm_acc"] = (
+        _masked_mean_tensor(action_exact.float(), action_selection_mask)
+    )
+    metrics[f"{prefix}/action_selection_mse_target_relative"] = (
+        _masked_mean_tensor(action_mse, action_selection_mask)
+    )
+    metrics[f"{prefix}/routing_exact_target_arm_acc"] = _masked_mean_tensor(
+        routing_exact.float(), routing_mask
+    )
+    metrics[f"{prefix}/routing_departure_rate"] = _masked_mean_tensor(
+        spatial_departed.float(), routing_mask
+    )
+
+    if valid_choice_masks is not None:
+        chosen_valid = torch.gather(
+            valid_choice_masks,
+            dim=-1,
+            index=pred_action_arm.unsqueeze(-1),
+        ).squeeze(-1) > 0.5
+        metrics[f"{prefix}/action_selection_valid_under_teacher_history_rate"] = (
+            _masked_mean_tensor(chosen_valid.float(), action_selection_mask)
+        )
 
     forced_orders = dataset.forced_orders.to(y.device)
-    choice_orders = dataset.choice_orders.to(y.device)
+
+    action_valid_vals = []
+    action_invalid_forced_vals = []
+    action_reentry_vals = []
+    route_departed_vals = []
+    route_matches_conditioning_vals = []
+    route_unvisited_vals = []
+    step_success_vals = []
+    first_action_valid_vals = []
+    complete_trial_vals = []
+    unique_unvisited_routed_counts = []
+    n_events = 0
 
     for b in range(B):
-        ts = torch.where(choice_departure_mask[b])[0]
-        # The target dataset has one center->arm departure per choice arm.
-        # Sort by time so j indexes first, second, third, fourth choice.
-        for j, t in enumerate(ts.tolist()):
-            pa = int(pred_arm[b, t].item())
-            ta = int(true_arm[b, t].item())
+        selection_times = torch.where(action_selection_mask[b])[0].tolist()
+        forced_set = {int(a.item()) for a in forced_orders[b]}
+        remaining_set = set(range(n_arms)) - forced_set
+        visited = set(forced_set)
+        unique_unvisited_routed = set()
+        trial_success = len(selection_times) == int(dataset.n_choice)
 
-            exact_departure.append(float(pa == ta))
-            no_arm_departure.append(float(pa < 0))
+        for j, t in enumerate(selection_times):
+            route_t = t + 1
+            if route_t >= T or not bool(routing_mask[b, route_t].item()):
+                trial_success = False
+                continue
 
-            if j == 0:
-                first_choice_exact.append(float(pa == ta))
+            selected_action = int(pred_action_arm[b, t].item())
+            predicted_route_arm = int(pred_arm[b, route_t].item())
+            target_route_arm = int(true_arm[b, route_t].item())
 
-            forced_set = set(int(a.item()) for a in forced_orders[b])
-            already_choice_set = set(int(a.item()) for a in choice_orders[b, :j])
-            remaining_choice_set = set(int(a.item()) for a in choice_orders[b, j:])
+            action_valid = selected_action not in visited
+            action_invalid_forced = selected_action in forced_set
+            action_reentry = selected_action in visited
+            route_departed = predicted_route_arm >= 0
+            route_unvisited = route_departed and predicted_route_arm not in visited
 
-            valid_unvisited.append(float(pa in remaining_choice_set))
-            invalid_forced.append(float(pa in forced_set))
-            invalid_choice_reentry.append(
-                float(pa in already_choice_set or pa in forced_set)
+            # Under teacher forcing, the next input contains the sampled target
+            # action. Under rollout, it contains the model's hardened selection.
+            conditioning_action = (
+                selected_action if rollout_mode else target_route_arm
             )
+            route_matches_conditioning = (
+                route_departed and predicted_route_arm == conditioning_action
+            )
+            step_success = action_valid and route_matches_conditioning
+
+            action_valid_vals.append(float(action_valid))
+            action_invalid_forced_vals.append(float(action_invalid_forced))
+            action_reentry_vals.append(float(action_reentry))
+            route_departed_vals.append(float(route_departed))
+            route_matches_conditioning_vals.append(
+                float(route_matches_conditioning)
+            )
+            route_unvisited_vals.append(float(route_unvisited))
+            step_success_vals.append(float(step_success))
+            if j == 0:
+                first_action_valid_vals.append(float(action_valid))
+            n_events += 1
+
+            trial_success = trial_success and step_success
+
+            if rollout_mode:
+                # Behavioral history follows where the spatial trajectory actually
+                # went, not the evaluator's target ordering.
+                if route_departed:
+                    if predicted_route_arm in remaining_set:
+                        unique_unvisited_routed.add(predicted_route_arm)
+                    visited.add(predicted_route_arm)
+            else:
+                # Teacher-forced input history follows the sampled valid route.
+                visited.add(target_route_arm)
+
+        if rollout_mode:
+            trial_success = (
+                trial_success
+                and len(unique_unvisited_routed) == int(dataset.n_choice)
+                and unique_unvisited_routed == remaining_set
+            )
+        complete_trial_vals.append(float(trial_success))
+        unique_unvisited_routed_counts.append(float(len(unique_unvisited_routed)))
 
     metrics.update(
         {
-            f"{prefix}/choice_departure_exact_arm_acc": _mean_or_nan(exact_departure),
-            f"{prefix}/first_choice_exact_arm_acc": _mean_or_nan(first_choice_exact),
-            f"{prefix}/valid_unvisited_choice_rate": _mean_or_nan(valid_unvisited),
-            f"{prefix}/invalid_forced_reentry_rate": _mean_or_nan(invalid_forced),
-            f"{prefix}/invalid_choice_reentry_rate": _mean_or_nan(
-                invalid_choice_reentry
+            f"{prefix}/dynamic_action_valid_unvisited_rate": _mean_or_nan(
+                action_valid_vals
             ),
-            f"{prefix}/choice_departure_no_arm_rate": _mean_or_nan(no_arm_departure),
-            f"{prefix}/n_choice_departures": float(len(exact_departure)),
+            f"{prefix}/dynamic_first_action_valid_rate": _mean_or_nan(
+                first_action_valid_vals
+            ),
+            f"{prefix}/dynamic_action_invalid_forced_rate": _mean_or_nan(
+                action_invalid_forced_vals
+            ),
+            f"{prefix}/dynamic_action_reentry_rate": _mean_or_nan(
+                action_reentry_vals
+            ),
+            f"{prefix}/dynamic_routing_departure_rate": _mean_or_nan(
+                route_departed_vals
+            ),
+            f"{prefix}/dynamic_routing_matches_conditioning_action_rate": (
+                _mean_or_nan(route_matches_conditioning_vals)
+            ),
+            f"{prefix}/dynamic_routing_enters_unvisited_rate": _mean_or_nan(
+                route_unvisited_vals
+            ),
+            f"{prefix}/dynamic_step_success_rate": _mean_or_nan(
+                step_success_vals
+            ),
+            f"{prefix}/dynamic_trial_complete_success_rate": _mean_or_nan(
+                complete_trial_vals
+            ),
+            f"{prefix}/dynamic_unique_unvisited_arms_routed_mean": _mean_or_nan(
+                unique_unvisited_routed_counts
+            ),
+            f"{prefix}/n_dynamic_choice_events": float(n_events),
         }
     )
 
-    # Optional auxiliary arm-choice head metrics. These exist for the new
-    # eight_arm_bump_traj version with n_space >= 40. They directly evaluate
-    # the 8 action/arm channels rather than decoding the arm only from position.
-    if hasattr(dataset, "arm_choice_start") and hasattr(dataset, "arm_choice_end"):
-        a0 = int(dataset.arm_choice_start)
-        a1 = int(dataset.arm_choice_end)
-        if a1 <= yhat.shape[-1]:
-            true_action_active = y[:, :, a0:a1].sum(dim=-1) > 0.5
-            pred_action_arm = yhat[:, :, a0:a1].argmax(dim=-1)
-            true_action_arm = y[:, :, a0:a1].argmax(dim=-1)
-            action_exact = pred_action_arm.eq(true_action_arm)
-            metrics[f"{prefix}/arm_choice_head_acc"] = _masked_mean_tensor(
-                action_exact.float(), true_action_active
-            )
-            metrics[f"{prefix}/arm_choice_head_acc_choice_departure"] = _masked_mean_tensor(
-                action_exact.float(), choice_departure_mask
-            )
-            action_mse = F.mse_loss(yhat[:, :, a0:a1], y[:, :, a0:a1], reduction="none").mean(dim=-1)
-            metrics[f"{prefix}/arm_choice_head_mse"] = _masked_mean_tensor(
-                action_mse, true_action_active
-            )
-            metrics[f"{prefix}/arm_choice_head_mse_choice_departure"] = _masked_mean_tensor(
-                action_mse, choice_departure_mask
-            )
-
-            # For the action-conditioned eight-arm task, the old "choice departure"
-            # event splits into two distinct transitions:
-            #   1) action selection: center(no arm cue) -> center(with arm cue)
-            #   2) spatial routing: center(with arm cue) -> first position on that arm
-            # These metrics separate memory/arm selection from action-conditioned
-            # spatial routing. For the older non-action-conditioned task, these masks
-            # will simply be empty or near-empty.
-            x_action_active = x[:, :, a0:a1].sum(dim=-1) > 0.5
-
-            action_selection_mask = (
-                (x_pos == dataset.center_idx)
-                & (~x_action_active)
-                & (true_pos == dataset.center_idx)
-                & true_action_active
-                & choice_mask
-            )
-
-            routing_mask = (
-                (x_pos == dataset.center_idx)
-                & x_action_active
-                & choice_mask
-                & (true_arm >= 0)
-            )
-
-            metrics[f"{prefix}/arm_choice_head_acc_action_selection"] = _masked_mean_tensor(
-                action_exact.float(), action_selection_mask
-            )
-            metrics[f"{prefix}/arm_choice_head_mse_action_selection"] = _masked_mean_tensor(
-                action_mse, action_selection_mask
-            )
-            metrics[f"{prefix}/arm_choice_head_acc_routing"] = _masked_mean_tensor(
-                action_exact.float(), routing_mask
-            )
-            metrics[f"{prefix}/arm_choice_head_mse_routing"] = _masked_mean_tensor(
-                action_mse, routing_mask
-            )
-
-            def event_stats(mask, decoded_pred_arm, name):
-                exact = []
-                first_exact = []
-                valid = []
-                invalid_forced_evt = []
-                invalid_choice_evt = []
-                no_arm = []
-
-                for b in range(B):
-                    ts = torch.where(mask[b])[0]
-                    forced_set = set(int(a.item()) for a in forced_orders[b])
-                    choice_list = [int(a.item()) for a in choice_orders[b]]
-
-                    for j, t in enumerate(ts.tolist()):
-                        pa = int(decoded_pred_arm[b, t].item())
-
-                        if name == "routing":
-                            ta = int(true_arm[b, t].item())
-                        else:
-                            ta = int(true_action_arm[b, t].item())
-
-                        already_choice_set = set(choice_list[:j])
-                        remaining_choice_set = set(choice_list[j:])
-
-                        exact.append(float(pa == ta))
-                        if j == 0:
-                            first_exact.append(float(pa == ta))
-                        valid.append(float(pa in remaining_choice_set))
-                        invalid_forced_evt.append(float(pa in forced_set))
-                        invalid_choice_evt.append(float(pa in already_choice_set or pa in forced_set))
-                        no_arm.append(float(pa < 0))
-
-                metrics[f"{prefix}/{name}_exact_arm_acc"] = _mean_or_nan(exact)
-                metrics[f"{prefix}/{name}_first_choice_exact_arm_acc"] = _mean_or_nan(first_exact)
-                metrics[f"{prefix}/{name}_valid_unvisited_rate"] = _mean_or_nan(valid)
-                metrics[f"{prefix}/{name}_invalid_forced_reentry_rate"] = _mean_or_nan(invalid_forced_evt)
-                metrics[f"{prefix}/{name}_invalid_choice_reentry_rate"] = _mean_or_nan(invalid_choice_evt)
-                metrics[f"{prefix}/{name}_no_arm_rate"] = _mean_or_nan(no_arm)
-                metrics[f"{prefix}/n_{name}_events"] = float(len(exact))
-
-            event_stats(
-                action_selection_mask,
-                pred_action_arm,
-                "action_selection",
-            )
-            event_stats(
-                routing_mask,
-                pred_arm,
-                "routing",
-            )
-
-            # A useful bridge diagnostic: at the routing step, does the spatial
-            # prediction agree with the arm-choice head prediction? This can reveal
-            # whether the model has selected an arm but fails to route the bump.
-            pred_action_active_arm = pred_action_arm
-
-            # End-to-end action-to-routing consistency:
-            # At a routing event, did the spatial prediction enter the same arm
-            # selected by the model's arm-choice head? No-arm predictions count
-            # as failures in this primary metric.
-            spatial_departed = pred_arm >= 0
-            spatial_action_agree = pred_arm.eq(pred_action_active_arm) & spatial_departed
-            metrics[f"{prefix}/routing_spatial_matches_arm_head_rate"] = _masked_mean_tensor(
-                spatial_action_agree.float(), routing_mask
-            )
-
-            # Conditional consistency:
-            # Among routing events where the spatial bump actually entered an arm,
-            # how often did it enter the arm selected by the action head?
-            departed_routing_mask = routing_mask & spatial_departed
-            metrics[
-                f"{prefix}/routing_spatial_matches_arm_head_given_departure_rate"
-            ] = _masked_mean_tensor(
-                pred_arm.eq(pred_action_active_arm).float(),
-                departed_routing_mask,
-            )
-
-            # Target-grounded end-to-end routing success:
-            # Did both the action head and spatial prediction agree with the
-            # ground-truth chosen arm at the routing transition?
-            action_matches_target = pred_action_active_arm.eq(true_arm)
-            spatial_matches_target = pred_arm.eq(true_arm) & spatial_departed
-            end_to_end_correct = action_matches_target & spatial_matches_target
-            metrics[f"{prefix}/action_to_target_routing_success_rate"] = _masked_mean_tensor(
-                end_to_end_correct.float(),
-                routing_mask,
-            )
-
     return metrics
-
 
 def _format_int_list(vals):
     return " ".join(str(int(v)) for v in vals)
 
 
 def eight_arm_choice_debug_rows(
-    yhat, x, y, dataset, split_name="rollout", max_trials=16
+    yhat,
+    x,
+    y,
+    dataset,
+    split_name="rollout",
+    max_trials=16,
 ):
-    """
-    Return row dictionaries describing the model's arm choices at the
-    memory-critical center->choice-arm departure steps.
+    """Return per-choice rows using the model's actual action and route."""
+    if not hasattr(dataset, "valid_choice_masks"):
+        return []
 
-    This is a debugging table, not a scalar metric. It lets you inspect
-    whether zero valid-choice scores are real failures or decoding issues.
-    """
-    B, T, N = y.shape
+    B, T, _ = y.shape
     n_pos = int(dataset.n_pos)
     arm_len = int(dataset.arm_len)
     n_arms = int(dataset.n_arms)
+    a0 = int(dataset.arm_choice_start)
+    a1 = int(dataset.arm_choice_end)
+    rollout_mode = split_name == "rollout"
 
     pred_pos = yhat[:, :, :n_pos].argmax(dim=-1)
     true_pos = y[:, :, :n_pos].argmax(dim=-1)
-    x_pos = x[:, :, :n_pos].argmax(dim=-1)
-
-    choice_mask = y[:, :, dataset.cue_choice] > 0.5
+    pred_action = yhat[:, :, a0:a1].argmax(dim=-1)
+    true_action = y[:, :, a0:a1].argmax(dim=-1)
 
     def pos_to_arm(pos):
         arm = torch.full_like(pos, -1)
@@ -394,87 +398,87 @@ def eight_arm_choice_debug_rows(
 
     pred_arm = pos_to_arm(pred_pos)
     true_arm = pos_to_arm(true_pos)
-
-    choice_departure_mask = (
-        (x_pos == dataset.center_idx) & choice_mask & (true_arm >= 0)
-    )
-
-    forced_orders = dataset.forced_orders.to(y.device)
-    choice_orders = dataset.choice_orders.to(y.device)
+    selection_mask = dataset.valid_choice_masks.to(y.device).sum(dim=-1) > 0.5
 
     rows = []
     n_show = min(B, max_trials)
-
     for b in range(n_show):
-        forced_list = [int(a.item()) for a in forced_orders[b]]
-        choice_list = [int(a.item()) for a in choice_orders[b]]
+        forced_list = [int(a.item()) for a in dataset.forced_orders[b]]
+        target_choice_list = [int(a.item()) for a in dataset.choice_orders[b]]
         forced_set = set(forced_list)
+        visited = set(forced_set)
 
-        ts = torch.where(choice_departure_mask[b])[0]
+        for j, t in enumerate(torch.where(selection_mask[b])[0].tolist()):
+            route_t = t + 1
+            if route_t >= T:
+                continue
 
-        for j, t in enumerate(ts.tolist()):
-            pa = int(pred_arm[b, t].item())
-            ta = int(true_arm[b, t].item())
+            selected = int(pred_action[b, t].item())
+            target_selected = int(true_action[b, t].item())
+            spatial_arm = int(pred_arm[b, route_t].item())
+            target_route_arm = int(true_arm[b, route_t].item())
+            valid_before = sorted(set(range(n_arms)) - visited)
 
-            already_choice_set = set(choice_list[:j])
-            remaining_choice_set = set(choice_list[j:])
+            action_valid = selected in valid_before
+            departed = spatial_arm >= 0
+            conditioning_action = selected if rollout_mode else target_route_arm
+            route_matches_conditioning = departed and spatial_arm == conditioning_action
+            route_matches_selected = departed and spatial_arm == selected
 
-            valid_unvisited = pa in remaining_choice_set
-            invalid_forced = pa in forced_set
-            invalid_choice_reentry = pa in already_choice_set or pa in forced_set
-            no_arm = pa < 0
-            exact = pa == ta
-
-            top_vals, top_idx = torch.topk(yhat[b, t, :n_pos], k=min(5, n_pos))
-            top_pos = [int(z.item()) for z in top_idx]
-            top_val = [float(z.item()) for z in top_vals]
-            top_arm = []
-            for pp in top_pos:
-                if pp == int(dataset.center_idx):
-                    top_arm.append("center")
-                elif 1 <= pp < n_pos:
-                    top_arm.append(str((pp - 1) // arm_len))
-                else:
-                    top_arm.append("other")
+            probs = torch.softmax(yhat[b, t, a0:a1], dim=-1)
+            top_vals, top_idx = torch.topk(probs, k=min(4, n_arms))
 
             rows.append(
                 {
                     "split": split_name,
                     "trial": b,
-                    "t": t,
                     "choice_index": j,
+                    "selection_t": t,
+                    "routing_t": route_t,
                     "forced_arms": _format_int_list(forced_list),
-                    "true_choice_order": _format_int_list(choice_list),
-                    "remaining_valid_arms": _format_int_list(choice_list[j:]),
-                    "already_choice_arms": _format_int_list(choice_list[:j]),
-                    "x_pos": int(x_pos[b, t].item()),
-                    "true_pos": int(true_pos[b, t].item()),
-                    "pred_pos": int(pred_pos[b, t].item()),
-                    "true_arm": ta,
-                    "pred_arm": pa,
-                    "exact_arm": int(exact),
-                    "valid_unvisited": int(valid_unvisited),
-                    "invalid_forced_reentry": int(invalid_forced),
-                    "invalid_choice_reentry": int(invalid_choice_reentry),
-                    "no_arm_departure": int(no_arm),
-                    "pred_center_value": float(yhat[b, t, dataset.center_idx].item()),
-                    "pred_true_pos_value": float(yhat[b, t, true_pos[b, t]].item()),
-                    "pred_pos_top5": _format_int_list(top_pos),
-                    "pred_arm_top5": " ".join(top_arm),
-                    "pred_value_top5": " ".join(f"{v:.4f}" for v in top_val),
+                    "visited_before": _format_int_list(sorted(visited)),
+                    "valid_before": _format_int_list(valid_before),
+                    "sampled_target_order": _format_int_list(target_choice_list),
+                    "selected_action": selected,
+                    "sampled_target_action": target_selected,
+                    "action_valid_unvisited": int(action_valid),
+                    "action_invalid_forced": int(selected in forced_set),
+                    "action_reentry": int(selected in visited),
+                    "predicted_spatial_arm": spatial_arm,
+                    "sampled_target_route_arm": target_route_arm,
+                    "spatial_departed": int(departed),
+                    "route_matches_selected_action": int(route_matches_selected),
+                    "route_matches_conditioning_action": int(
+                        route_matches_conditioning
+                    ),
+                    "top_action_arms": _format_int_list(
+                        [int(z.item()) for z in top_idx]
+                    ),
+                    "top_action_probs": " ".join(
+                        f"{float(z.item()):.4f}" for z in top_vals
+                    ),
                 }
             )
+
+            if rollout_mode:
+                if departed:
+                    visited.add(spatial_arm)
+            else:
+                visited.add(target_route_arm)
 
     return rows
 
 
 def write_eight_arm_choice_debug(
-    model, dataset, device, out_dir, prefix_len, max_trials=16
+    model,
+    dataset,
+    device,
+    out_dir,
+    prefix_len,
+    max_trials=16,
+    hard_action_choices=True,
 ):
-    """
-    Write a CSV with per-trial choice-departure debug info for teacher-forced
-    and autonomous rollout predictions.
-    """
+    """Write teacher-forced and autonomous per-choice diagnostics."""
     if max_trials <= 0:
         return
 
@@ -484,7 +488,13 @@ def write_eight_arm_choice_debug(
 
     with torch.no_grad():
         yhat_tf, _ = model(x)
-        yhat_roll = autonomous_rollout(model, x, prefix_len=prefix_len)
+        yhat_roll = autonomous_rollout(
+            model,
+            x,
+            prefix_len=prefix_len,
+            dataset=dataset,
+            hard_action_choices=hard_action_choices,
+        )
 
     rows = []
     rows.extend(
@@ -508,20 +518,17 @@ def write_eight_arm_choice_debug(
         )
     )
 
-    if len(rows) == 0:
-        print("No eight-arm choice-departure rows found for debugging.")
+    if not rows:
+        print("No eight-arm choice rows found for debugging.")
         return
 
     out_path = out_dir / "eightarm_choice_debug.csv"
-    fieldnames = list(rows[0].keys())
-
     with open(out_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
 
     print(f"Saved eight-arm choice debug table to {out_path}")
-
 
 def teacher_forced_eight_arm_eval(model, dataset, device):
     model.eval()
@@ -535,38 +542,47 @@ def teacher_forced_eight_arm_eval(model, dataset, device):
         y=y,
         dataset=dataset,
         prefix="eightarm_tf",
+        rollout_mode=False,
     )
 
 
-def rollout_eight_arm_eval(model, dataset, device, prefix_len):
+def rollout_eight_arm_eval(
+    model,
+    dataset,
+    device,
+    prefix_len,
+    hard_action_choices=True,
+):
     model.eval()
     x = dataset.x.to(device)
     y = dataset.y.to(device)
-    yhat = autonomous_rollout(model, x, prefix_len=prefix_len)
+    yhat = autonomous_rollout(
+        model,
+        x,
+        prefix_len=prefix_len,
+        dataset=dataset,
+        hard_action_choices=hard_action_choices,
+    )
     return eight_arm_traj_metrics(
         yhat=yhat,
         x=x,
         y=y,
         dataset=dataset,
         prefix="eightarm_rollout",
+        rollout_mode=True,
     )
 
 
 def _unpack_xy(batch):
-    """
-    Support datasets that return either:
-        (x, y)
-    or weighted datasets that return:
-        (x, y, loss_weights)
-
-    Analysis only needs x and y.
-    """
+    """Extract x and y from datasets returning 2, 3, or 4 tensors."""
     if len(batch) == 2:
         x, y = batch
     elif len(batch) == 3:
         x, y, _ = batch
+    elif len(batch) == 4:
+        x, y, _, _ = batch
     else:
-        raise ValueError(f"Expected batch of length 2 or 3, got {len(batch)}")
+        raise ValueError(f"Expected batch of length 2, 3, or 4, got {len(batch)}")
     return x, y
 
 
@@ -616,27 +632,52 @@ def teacher_forced_eval(model, loader, device):
     return metrics
 
 
-def autonomous_rollout(model, x, prefix_len):
-    """
-    Autoregressive rollout.
+def autonomous_rollout(
+    model,
+    x,
+    prefix_len,
+    dataset=None,
+    hard_action_choices=True,
+):
+    """Autoregressive rollout with optional discrete arm decisions.
 
-    First prefix_len inputs are true.
-    After that, each previous prediction becomes the next input.
-
-    x: [B, T, N]
-    returns:
-        yhat_roll: [B, T, N]
+    The evaluator may harden the eight arm-action outputs to a one-hot vector at
+    known choice times before feeding them back. It uses only the timing of the
+    choice event, never the valid-arm entries, so no visited-set information is
+    leaked to the model.
     """
     model.eval()
 
-    B, T, N = x.shape
+    _, T, _ = x.shape
     u_roll = x.clone()
     preds = []
+
+    selection_schedule = None
+    a0 = a1 = None
+    if (
+        dataset is not None
+        and hard_action_choices
+        and hasattr(dataset, "valid_choice_masks")
+        and hasattr(dataset, "arm_choice_start")
+    ):
+        selection_schedule = (
+            dataset.valid_choice_masks.to(x.device).sum(dim=-1) > 0.5
+        )
+        a0 = int(dataset.arm_choice_start)
+        a1 = int(dataset.arm_choice_end)
 
     with torch.no_grad():
         for t in range(T):
             yhat_prefix, _ = model(u_roll[:, : t + 1, :])
             pred_t = yhat_prefix[:, -1, :]
+
+            if selection_schedule is not None:
+                active_rows = torch.where(selection_schedule[:, t])[0]
+                if len(active_rows) > 0:
+                    pred_t = pred_t.clone()
+                    choices = pred_t[active_rows, a0:a1].argmax(dim=-1)
+                    pred_t[active_rows, a0:a1] = 0.0
+                    pred_t[active_rows, a0 + choices] = 1.0
 
             preds.append(pred_t)
 
@@ -653,11 +694,18 @@ def rollout_eval_and_plots(
     out_dir,
     prefix_len=5,
     angle_threshold_rad=0.75,
+    hard_action_choices=True,
 ):
     x = dataset.x.to(device)
     y = dataset.y.to(device)
 
-    yhat = autonomous_rollout(model, x, prefix_len=prefix_len)
+    yhat = autonomous_rollout(
+        model,
+        x,
+        prefix_len=prefix_len,
+        dataset=dataset,
+        hard_action_choices=hard_action_choices,
+    )
 
     mse_t = F.mse_loss(yhat, y, reduction="none").mean(dim=(0, 2)).cpu().numpy()
 
@@ -758,6 +806,12 @@ def main(args):
 
     test_loader = DataLoader(test_ds, batch_size=args.batch_size)
 
+    if args.prefix_len < 0:
+        prefix_len = int(getattr(test_ds, "rollout_prefix_len", 5))
+    else:
+        prefix_len = int(args.prefix_len)
+    hard_action_choices = not args.soft_action_rollout
+
     if args.out_dir == "auto":
         out_dir = Path(args.ckpt).parent / "analysis"
     else:
@@ -781,8 +835,9 @@ def main(args):
             dataset=test_ds,
             device=device,
             out_dir=out_dir,
-            prefix_len=args.prefix_len,
+            prefix_len=prefix_len,
             angle_threshold_rad=args.angle_threshold_rad,
+            hard_action_choices=hard_action_choices,
         )
     )
 
@@ -799,7 +854,8 @@ def main(args):
                 model=model,
                 dataset=test_ds,
                 device=device,
-                prefix_len=args.prefix_len,
+                prefix_len=prefix_len,
+                hard_action_choices=hard_action_choices,
             )
         )
         write_eight_arm_choice_debug(
@@ -807,13 +863,16 @@ def main(args):
             dataset=test_ds,
             device=device,
             out_dir=out_dir,
-            prefix_len=args.prefix_len,
+            prefix_len=prefix_len,
             max_trials=args.debug_trials,
+            hard_action_choices=hard_action_choices,
         )
 
     write_metrics(metrics, out_dir)
 
     print(f"Analysis for {args.ckpt}")
+    print(f"Rollout prefix length: {prefix_len}")
+    print(f"Hard action choices: {hard_action_choices}")
     for k, v in sorted(metrics.items()):
         print(f"{k}: {v:.6f}")
 
@@ -831,7 +890,23 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--seed", type=int, default=123)
 
-    p.add_argument("--prefix-len", type=int, default=5)
+    p.add_argument(
+        "--prefix-len",
+        type=int,
+        default=-1,
+        help=(
+            "Number of true input frames before autoregressive feedback. "
+            "Use -1 to infer the first choice point from the dataset."
+        ),
+    )
+    p.add_argument(
+        "--soft-action-rollout",
+        action="store_true",
+        help=(
+            "Feed raw arm-head outputs back at choice events. By default the "
+            "argmax action is converted to one-hot before routing."
+        ),
+    )
     p.add_argument("--angle-threshold-rad", type=float, default=0.75)
     p.add_argument("--debug-trials", type=int, default=16)
 

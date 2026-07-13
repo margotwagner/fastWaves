@@ -524,6 +524,7 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         reward_hold_steps: int = 1,
         center_hold_steps: int = 0,
         choice_order: str = "random",
+        choice_objective: str = "valid_set",
         bump_sigma: float = 0.75,
         forced_departure_weight: float = 3.0,
         choice_departure_weight: float = 10.0,
@@ -540,6 +541,8 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
             raise ValueError("arm_len must be at least 2.")
         if choice_order not in {"random", "ascending"}:
             raise ValueError("choice_order must be 'random' or 'ascending'.")
+        if choice_objective not in {"exact", "valid_set"}:
+            raise ValueError("choice_objective must be 'exact' or 'valid_set'.")
         if bump_sigma <= 0:
             raise ValueError("bump_sigma must be positive.")
 
@@ -553,6 +556,7 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         self.reward_hold_steps = reward_hold_steps
         self.center_hold_steps = center_hold_steps
         self.choice_order = choice_order
+        self.choice_objective = choice_objective
         self.bump_sigma = float(bump_sigma)
         self.forced_departure_weight = float(forced_departure_weight)
         self.choice_departure_weight = float(choice_departure_weight)
@@ -591,6 +595,11 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         natural_frames = (n_arms * self.visit_len) + settle_steps
         self.natural_seq_len = natural_frames - 1
 
+        # True inputs are supplied through the first choice-phase center frame.
+        # The model then predicts the arm action, which is fed back on the next step.
+        self.first_choice_frame = (n_forced * self.visit_len) + settle_steps
+        self.rollout_prefix_len = self.first_choice_frame + 1
+
         if seq_len is None:
             seq_len = self.natural_seq_len
         if seq_len < self.natural_seq_len:
@@ -606,6 +615,13 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         forced_orders = torch.empty(n_samples, n_forced, dtype=torch.long)
         choice_orders = torch.empty(n_samples, self.n_choice, dtype=torch.long)
         full_orders = torch.empty(n_samples, n_arms, dtype=torch.long)
+
+        # Supervision metadata. These masks are never included in x and therefore
+        # are never shown to the model. At each choice event, ones mark every arm
+        # that remains unvisited in the teacher-forced history.
+        valid_choice_masks = torch.zeros(
+            n_samples, self.seq_len, n_arms, dtype=torch.float32
+        )
 
         for i in range(n_samples):
             perm = torch.randperm(n_arms, generator=g)
@@ -643,6 +659,34 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
             xs[i, : x.shape[0], :] = x
             ys[i, : y.shape[0], :] = y
 
+            # Find the four memory-dependent action-selection transitions:
+            # center(no action) -> center(action). The sampled route provides one
+            # teacher-forced continuation, but every currently unvisited arm is
+            # accepted by the valid-set choice loss.
+            x_pos = x[:, : self.n_pos].argmax(dim=-1)
+            y_pos = y[:, : self.n_pos].argmax(dim=-1)
+            x_action_active = (
+                x[:, self.arm_choice_start : self.arm_choice_end].sum(dim=-1) > 0.5
+            )
+            y_action_active = (
+                y[:, self.arm_choice_start : self.arm_choice_end].sum(dim=-1) > 0.5
+            )
+            action_selection = (
+                (x_pos == self.center_idx)
+                & (~x_action_active)
+                & (y_pos == self.center_idx)
+                & y_action_active
+                & (y[:, self.cue_choice] > 0.5)
+            )
+            selection_times = torch.where(action_selection)[0]
+            if len(selection_times) != self.n_choice:
+                raise RuntimeError(
+                    f"Expected {self.n_choice} choice events, found "
+                    f"{len(selection_times)} for trial {i}."
+                )
+            for j, t in enumerate(selection_times.tolist()):
+                valid_choice_masks[i, t, remaining[j:]] = 1.0
+
             if x.shape[0] < self.seq_len:
                 pad_frame = self._make_frame(
                     pos_idx=self.center_idx,
@@ -655,10 +699,20 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
 
         self.x = xs.float()
         self.y = ys.float()
-        self.loss_weights = self._make_elementwise_loss_weights()
+        self.valid_choice_masks = valid_choice_masks.float()
+
+        # In exact mode the valid masks remain available for evaluation, but the
+        # training loss uses the sampled one-hot target. In valid_set mode they
+        # drive the partial-label choice loss.
+        if self.choice_objective == "valid_set":
+            self.choice_loss_masks = self.valid_choice_masks.clone()
+        else:
+            self.choice_loss_masks = torch.zeros_like(self.valid_choice_masks)
+
         self.forced_orders = forced_orders
         self.choice_orders = choice_orders
         self.full_orders = full_orders
+        self.loss_weights = self._make_elementwise_loss_weights()
 
     def arm_pos_idx(self, arm: int, depth: int) -> int:
         return 1 + arm * self.arm_len + depth
@@ -828,11 +882,29 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         routing_transition = center_to_arm & x_arm_choice_active
         weights[routing_transition, : self.n_pos] = self.routing_weight
 
-        # The arm-choice head is the direct supervision for the branch decision.
+        # The arm-choice head is supervised throughout a sampled arm trajectory.
         arm_choice_active = (
             self.y[:, :, self.arm_choice_start : self.arm_choice_end].sum(dim=-1) > 0
         )
-        weights[arm_choice_active, self.arm_choice_start : self.arm_choice_end] = self.arm_choice_weight
+        b_idx, t_idx = torch.where(arm_choice_active)
+        weights[
+            b_idx,
+            t_idx,
+            self.arm_choice_start : self.arm_choice_end,
+        ] = self.arm_choice_weight
+
+        if self.choice_objective == "valid_set":
+            # At memory-dependent selection events, several arms are correct.
+            # Remove the arbitrary sampled one-hot MSE only at those events; the
+            # set-valued loss in train.py replaces it. Routing and action
+            # persistence remain one-hot supervised after an action is present.
+            action_selection = self.valid_choice_masks.sum(dim=-1) > 0.5
+            b_idx, t_idx = torch.where(action_selection)
+            weights[
+                b_idx,
+                t_idx,
+                self.arm_choice_start : self.arm_choice_end,
+            ] = 0.0
 
         return weights
 
@@ -840,7 +912,12 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         return self.n_samples
 
     def __getitem__(self, idx):
-        return self.x[idx], self.y[idx], self.loss_weights[idx]
+        return (
+            self.x[idx],
+            self.y[idx],
+            self.loss_weights[idx],
+            self.choice_loss_masks[idx],
+        )
 
 
 def build_dataset(args, n_samples, seed):
@@ -902,6 +979,7 @@ def build_dataset(args, n_samples, seed):
             reward_hold_steps=getattr(args, "reward_hold_steps", 1),
             center_hold_steps=getattr(args, "center_hold_steps", 0),
             choice_order=getattr(args, "choice_order", "random"),
+            choice_objective=getattr(args, "choice_objective", "valid_set"),
             bump_sigma=getattr(args, "bump_sigma", 0.75),
             forced_departure_weight=getattr(args, "forced_departure_weight", 3.0),
             choice_departure_weight=getattr(args, "choice_departure_weight", 10.0),

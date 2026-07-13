@@ -73,14 +73,22 @@ def build_model(args):
 
 
 def unpack_batch(batch, device):
-    """Support datasets returning (x, y) or (x, y, weights)."""
+    """Support datasets returning 2, 3, or 4 tensors."""
+    if len(batch) == 4:
+        x, y, weights, valid_choice_masks = batch
+        return (
+            x.to(device),
+            y.to(device),
+            weights.to(device),
+            valid_choice_masks.to(device),
+        )
     if len(batch) == 3:
         x, y, weights = batch
-        return x.to(device), y.to(device), weights.to(device)
+        return x.to(device), y.to(device), weights.to(device), None
     if len(batch) == 2:
         x, y = batch
-        return x.to(device), y.to(device), None
-    raise ValueError(f"Expected batch length 2 or 3, got {len(batch)}")
+        return x.to(device), y.to(device), None, None
+    raise ValueError(f"Expected batch length 2, 3, or 4, got {len(batch)}")
 
 
 def sequence_mse_loss(yhat, y, weights=None):
@@ -98,6 +106,36 @@ def sequence_mse_loss(yhat, y, weights=None):
     if weights.ndim == 3:
         return (sq * weights).sum() / weights.sum().clamp_min(1e-8)
     raise ValueError(f"Expected weights ndim 2 or 3, got {weights.ndim}")
+
+def valid_choice_set_loss(
+    yhat,
+    valid_choice_masks,
+    arm_choice_start,
+    arm_choice_end,
+):
+    """
+    Partial-label categorical loss for the memory-dependent arm decision.
+
+    At an active choice event, valid_choice_masks[b, t, a] is one for every
+    arm that is still unvisited in that teacher-forced history. The mask is
+    supervision metadata only; it is never passed into model(x).
+
+    The loss is -log of the total softmax probability assigned to valid arms.
+    """
+    if valid_choice_masks is None:
+        return yhat.new_zeros(())
+
+    active = valid_choice_masks.sum(dim=-1) > 0.5
+    if not active.any():
+        return yhat.new_zeros(())
+
+    logits = yhat[..., arm_choice_start:arm_choice_end][active]
+    masks = valid_choice_masks[active].bool()
+    log_probs = F.log_softmax(logits, dim=-1)
+    valid_log_probs = log_probs.masked_fill(~masks, float("-inf"))
+    log_valid_mass = torch.logsumexp(valid_log_probs, dim=-1)
+    return -log_valid_mass.mean()
+
 
 def train(args):
     torch.manual_seed(args.seed)
@@ -122,25 +160,65 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_loss = 0.0
+        train_mse = 0.0
+        train_choice = 0.0
         for batch in train_loader:
-            x, y, weights = unpack_batch(batch, device)
+            x, y, weights, valid_choice_masks = unpack_batch(batch, device)
             opt.zero_grad(set_to_none=True)
             yhat, extras = model(x)
-            loss = sequence_mse_loss(yhat, y, weights)
+
+            mse_loss = sequence_mse_loss(yhat, y, weights)
+            choice_loss = yhat.new_zeros(())
+            if valid_choice_masks is not None:
+                choice_loss = valid_choice_set_loss(
+                    yhat=yhat,
+                    valid_choice_masks=valid_choice_masks,
+                    arm_choice_start=train_ds.arm_choice_start,
+                    arm_choice_end=train_ds.arm_choice_end,
+                )
+            loss = mse_loss + args.valid_choice_loss_weight * choice_loss
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
-            train_loss += loss.item() * x.size(0)
+
+            batch_n = x.size(0)
+            train_loss += loss.item() * batch_n
+            train_mse += mse_loss.item() * batch_n
+            train_choice += choice_loss.item() * batch_n
+
         train_loss /= len(train_ds)
+        train_mse /= len(train_ds)
+        train_choice /= len(train_ds)
 
         model.eval()
         val_loss = 0.0
+        val_mse = 0.0
+        val_choice = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                x, y, weights = unpack_batch(batch, device)
+                x, y, weights, valid_choice_masks = unpack_batch(batch, device)
                 yhat, extras = model(x)
-                val_loss += sequence_mse_loss(yhat, y, weights).item() * x.size(0)
+
+                mse_loss = sequence_mse_loss(yhat, y, weights)
+                choice_loss = yhat.new_zeros(())
+                if valid_choice_masks is not None:
+                    choice_loss = valid_choice_set_loss(
+                        yhat=yhat,
+                        valid_choice_masks=valid_choice_masks,
+                        arm_choice_start=val_ds.arm_choice_start,
+                        arm_choice_end=val_ds.arm_choice_end,
+                    )
+                loss = mse_loss + args.valid_choice_loss_weight * choice_loss
+
+                batch_n = x.size(0)
+                val_loss += loss.item() * batch_n
+                val_mse += mse_loss.item() * batch_n
+                val_choice += choice_loss.item() * batch_n
+
         val_loss /= len(val_ds)
+        val_mse /= len(val_ds)
+        val_choice /= len(val_ds)
 
         if val_loss < best_val:
             best_val = val_loss
@@ -149,7 +227,15 @@ def train(args):
                 out_dir / "best.pt",
             )
 
-        row = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss}
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_mse": train_mse,
+            "val_mse": val_mse,
+            "train_valid_choice_loss": train_choice,
+            "val_valid_choice_loss": val_choice,
+        }
         if "fast_weight_norm" in extras:
             row["extras/fast_weight_norm_mean"] = (
                 extras["fast_weight_norm"].mean().item()
@@ -159,7 +245,10 @@ def train(args):
         history.append(row)
 
         if epoch == 1 or epoch % args.print_every == 0:
-            msg = f"epoch {epoch:04d} | train {train_loss:.6f} | val {val_loss:.6f}"
+            msg = (
+                f"epoch {epoch:04d} | train {train_loss:.6f} | val {val_loss:.6f}"
+                f" | mse {val_mse:.6f} | choice {val_choice:.6f}"
+            )
             if "fast_weight_norm" in extras:
                 msg += f" | F_norm {extras['fast_weight_norm'].mean().item():.4f}"
             print(msg)
@@ -173,6 +262,16 @@ def train(args):
             {"metric": "teacher_forced_mse", "value": float(final["val_loss"])},
             {"metric": "final_train_loss", "value": float(final["train_loss"])},
             {"metric": "final_val_loss", "value": float(final["val_loss"])},
+            {"metric": "final_train_mse", "value": float(final["train_mse"])},
+            {"metric": "final_val_mse", "value": float(final["val_mse"])},
+            {
+                "metric": "final_train_valid_choice_loss",
+                "value": float(final["train_valid_choice_loss"]),
+            },
+            {
+                "metric": "final_val_valid_choice_loss",
+                "value": float(final["val_valid_choice_loss"]),
+            },
         ]
         for k in ["extras/fast_weight_norm_mean", "extras/fast_drive_norm_mean"]:
             if k in final:
@@ -221,6 +320,21 @@ def parse_args():
     p.add_argument("--reward-hold-steps", type=int, default=1)
     p.add_argument("--center-hold-steps", type=int, default=0)
     p.add_argument("--choice-order", choices=["random", "ascending"], default="random")
+    p.add_argument(
+        "--choice-objective",
+        choices=["exact", "valid_set"],
+        default="valid_set",
+        help=(
+            "exact uses the sampled one-hot choice target; valid_set accepts any "
+            "currently unvisited arm at action-selection events."
+        ),
+    )
+    p.add_argument(
+        "--valid-choice-loss-weight",
+        type=float,
+        default=1.0,
+        help="Multiplier on the set-valued arm-choice loss.",
+    )
     p.add_argument("--n-arms", type=int, default=8)
     p.add_argument("--n-forced", type=int, default=4)
     p.add_argument("--expose-visited-memory", action="store_true")

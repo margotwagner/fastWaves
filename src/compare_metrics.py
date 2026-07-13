@@ -17,36 +17,35 @@ BASE_COLS = [
 # Task-specific columns emitted by the updated analyze.py for eight_arm_traj.
 EIGHT_ARM_COLS = [
     "run",
-    # Generic losses
+    # Generic diagnostics
     "teacher_forced_mse",
     "rollout_mse_mean",
-    # Best behavioral / working-memory metrics
-    "eightarm_rollout/first_choice_exact_arm_acc",
-    "eightarm_rollout/valid_unvisited_choice_rate",
-    "eightarm_rollout/invalid_forced_reentry_rate",
-    "eightarm_rollout/invalid_choice_reentry_rate",
-    "eightarm_rollout/choice_departure_exact_arm_acc",
-    "eightarm_rollout/mse_choice",
-    "eightarm_rollout/position_acc_choice",
-    # Teacher-forced versions, useful for separating training failure from rollout failure
-    "eightarm_tf/first_choice_exact_arm_acc",
-    "eightarm_tf/valid_unvisited_choice_rate",
-    "eightarm_tf/invalid_forced_reentry_rate",
-    "eightarm_tf/invalid_choice_reentry_rate",
-    "eightarm_tf/choice_departure_exact_arm_acc",
-    "eightarm_tf/mse_choice",
-    "eightarm_tf/position_acc_choice",
-    # Optional phase-specific diagnostics
-    "eightarm_rollout/mse_forced",
-    "eightarm_rollout/mse_settle",
-    "eightarm_rollout/position_acc",
-    "eightarm_rollout/position_acc_forced",
-    "eightarm_rollout/position_acc_settle",
+    "final_val_valid_choice_loss",
+    # Primary autonomous behavioral metrics. These use the model's own choices
+    # and update visited history from the spatial arms it actually enters.
+    "eightarm_rollout/dynamic_first_action_valid_rate",
+    "eightarm_rollout/dynamic_action_valid_unvisited_rate",
+    "eightarm_rollout/dynamic_action_invalid_forced_rate",
+    "eightarm_rollout/dynamic_action_reentry_rate",
+    "eightarm_rollout/dynamic_routing_departure_rate",
+    "eightarm_rollout/dynamic_routing_matches_conditioning_action_rate",
+    "eightarm_rollout/dynamic_routing_enters_unvisited_rate",
+    "eightarm_rollout/dynamic_step_success_rate",
+    "eightarm_rollout/dynamic_trial_complete_success_rate",
+    "eightarm_rollout/dynamic_unique_unvisited_arms_routed_mean",
+    # Teacher-forced diagnostics separate choice-memory from routing.
+    "eightarm_tf/action_selection_valid_under_teacher_history_rate",
+    "eightarm_tf/action_selection_exact_target_arm_acc",
+    "eightarm_tf/routing_exact_target_arm_acc",
+    "eightarm_tf/dynamic_routing_matches_conditioning_action_rate",
+    # Target-relative rollout values are retained only as secondary diagnostics.
+    "eightarm_rollout/action_selection_exact_target_arm_acc",
+    "eightarm_rollout/routing_exact_target_arm_acc",
+    "eightarm_rollout/mse_choice_target_relative",
     # Fast-weight diagnostics
     "extras/fast_weight_norm_mean",
     "extras/fast_drive_norm_mean",
 ]
-
 
 def infer_run_name(path: str) -> str:
     """
