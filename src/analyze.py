@@ -208,9 +208,19 @@ def eight_arm_traj_metrics(
     )
 
     action_exact = pred_action_arm.eq(true_action_arm)
+    action_logits = yhat[:, :, a0:a1]
     action_mse = F.mse_loss(
-        yhat[:, :, a0:a1], y[:, :, a0:a1], reduction="none"
+        action_logits, y[:, :, a0:a1], reduction="none"
     ).mean(dim=-1)
+
+    action_probs = torch.softmax(action_logits, dim=-1)
+    action_entropy = -(
+        action_probs * torch.log(action_probs.clamp_min(1e-8))
+    ).sum(dim=-1)
+    top2_probs = torch.topk(action_probs, k=2, dim=-1).values
+    action_top1_prob = top2_probs[..., 0]
+    action_top1_top2_margin = top2_probs[..., 0] - top2_probs[..., 1]
+
     spatial_departed = pred_arm >= 0
     routing_exact = pred_arm.eq(true_arm) & spatial_departed
 
@@ -222,6 +232,15 @@ def eight_arm_traj_metrics(
     )
     metrics[f"{prefix}/action_selection_mse_target_relative"] = (
         _masked_mean_tensor(action_mse, action_selection_mask)
+    )
+    metrics[f"{prefix}/action_selection_entropy"] = _masked_mean_tensor(
+        action_entropy, action_selection_mask
+    )
+    metrics[f"{prefix}/action_selection_top1_probability"] = _masked_mean_tensor(
+        action_top1_prob, action_selection_mask
+    )
+    metrics[f"{prefix}/action_selection_top1_top2_margin"] = _masked_mean_tensor(
+        action_top1_top2_margin, action_selection_mask
     )
     metrics[f"{prefix}/routing_exact_target_arm_acc"] = _masked_mean_tensor(
         routing_exact.float(), routing_mask
@@ -263,7 +282,7 @@ def eight_arm_traj_metrics(
         trial_success = len(selection_times) == int(dataset.n_choice)
 
         for j, t in enumerate(selection_times):
-            route_t = t + 1
+            route_t = t + int(getattr(dataset, "selection_to_routing_offset", 1))
             if route_t >= T or not bool(routing_mask[b, route_t].item()):
                 trial_success = False
                 continue
@@ -409,7 +428,7 @@ def eight_arm_choice_debug_rows(
         visited = set(forced_set)
 
         for j, t in enumerate(torch.where(selection_mask[b])[0].tolist()):
-            route_t = t + 1
+            route_t = t + int(getattr(dataset, "selection_to_routing_offset", 1))
             if route_t >= T:
                 continue
 
@@ -427,6 +446,14 @@ def eight_arm_choice_debug_rows(
 
             probs = torch.softmax(yhat[b, t, a0:a1], dim=-1)
             top_vals, top_idx = torch.topk(probs, k=min(4, n_arms))
+            entropy = float(
+                -(probs * torch.log(probs.clamp_min(1e-8))).sum().item()
+            )
+            margin = float(
+                (top_vals[0] - top_vals[1]).item()
+                if len(top_vals) > 1
+                else top_vals[0].item()
+            )
 
             rows.append(
                 {
@@ -457,6 +484,9 @@ def eight_arm_choice_debug_rows(
                     "top_action_probs": " ".join(
                         f"{float(z.item()):.4f}" for z in top_vals
                     ),
+                    "action_entropy": entropy,
+                    "action_top1_probability": float(top_vals[0].item()),
+                    "action_top1_top2_margin": margin,
                 }
             )
 

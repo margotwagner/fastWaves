@@ -38,6 +38,7 @@ def build_model(args):
             dt=args.dt,
             omega=args.omega,
             damping=args.damping,
+            readout_state=getattr(args, "wave_readout", "x"),
         )
     if args.model == "localfast":
         return LocalFastRNN(
@@ -63,6 +64,7 @@ def build_model(args):
             dt=args.dt,
             omega=args.omega,
             damping=args.damping,
+            readout_state=getattr(args, "wave_readout", "x"),
             lam=args.lam,
             eta=args.eta,
             beta=args.beta,
@@ -137,6 +139,57 @@ def valid_choice_set_loss(
     return -log_valid_mass.mean()
 
 
+def valid_choice_commitment_loss(
+    yhat,
+    valid_choice_masks,
+    arm_choice_start,
+    arm_choice_end,
+):
+    """Encourage a decisive categorical choice while accepting any valid arm.
+
+    For each action-selection event, find the model's highest-logit arm among
+    the currently valid arms, detach that pseudo-target, and train the full
+    eight-way action head toward it. Invalid arms remain competitors in the
+    cross-entropy denominator, so they are penalized. The valid mask is loss
+    metadata only and is never passed to model(x).
+    """
+    if valid_choice_masks is None:
+        return yhat.new_zeros(())
+
+    active = valid_choice_masks.sum(dim=-1) > 0.5
+    if not active.any():
+        return yhat.new_zeros(())
+
+    logits = yhat[..., arm_choice_start:arm_choice_end][active]
+    valid = valid_choice_masks[active].bool()
+    valid_logits = logits.masked_fill(~valid, float("-inf"))
+    chosen_valid_arm = valid_logits.detach().argmax(dim=-1)
+    return F.cross_entropy(logits, chosen_valid_arm)
+
+
+def compute_choice_loss(
+    yhat,
+    valid_choice_masks,
+    dataset,
+    choice_objective,
+):
+    """Dispatch the choice loss while preserving exact one-hot supervision."""
+    if valid_choice_masks is None or choice_objective == "exact":
+        return yhat.new_zeros(())
+
+    kwargs = dict(
+        yhat=yhat,
+        valid_choice_masks=valid_choice_masks,
+        arm_choice_start=dataset.arm_choice_start,
+        arm_choice_end=dataset.arm_choice_end,
+    )
+    if choice_objective == "valid_set":
+        return valid_choice_set_loss(**kwargs)
+    if choice_objective == "commitment":
+        return valid_choice_commitment_loss(**kwargs)
+    raise ValueError(f"Unknown choice_objective: {choice_objective}")
+
+
 def train(args):
     torch.manual_seed(args.seed)
     device = torch.device(
@@ -168,14 +221,12 @@ def train(args):
             yhat, extras = model(x)
 
             mse_loss = sequence_mse_loss(yhat, y, weights)
-            choice_loss = yhat.new_zeros(())
-            if valid_choice_masks is not None:
-                choice_loss = valid_choice_set_loss(
-                    yhat=yhat,
-                    valid_choice_masks=valid_choice_masks,
-                    arm_choice_start=train_ds.arm_choice_start,
-                    arm_choice_end=train_ds.arm_choice_end,
-                )
+            choice_loss = compute_choice_loss(
+                yhat=yhat,
+                valid_choice_masks=valid_choice_masks,
+                dataset=train_ds,
+                choice_objective=getattr(args, "choice_objective", "exact"),
+            )
             loss = mse_loss + args.valid_choice_loss_weight * choice_loss
 
             loss.backward()
@@ -201,14 +252,12 @@ def train(args):
                 yhat, extras = model(x)
 
                 mse_loss = sequence_mse_loss(yhat, y, weights)
-                choice_loss = yhat.new_zeros(())
-                if valid_choice_masks is not None:
-                    choice_loss = valid_choice_set_loss(
-                        yhat=yhat,
-                        valid_choice_masks=valid_choice_masks,
-                        arm_choice_start=val_ds.arm_choice_start,
-                        arm_choice_end=val_ds.arm_choice_end,
-                    )
+                choice_loss = compute_choice_loss(
+                    yhat=yhat,
+                    valid_choice_masks=valid_choice_masks,
+                    dataset=val_ds,
+                    choice_objective=getattr(args, "choice_objective", "exact"),
+                )
                 loss = mse_loss + args.valid_choice_loss_weight * choice_loss
 
                 batch_n = x.size(0)
@@ -259,7 +308,7 @@ def train(args):
 
         final = history[-1]
         metrics = [
-            {"metric": "teacher_forced_mse", "value": float(final["val_loss"])},
+            {"metric": "teacher_forced_mse", "value": float(final["val_mse"])},
             {"metric": "final_train_loss", "value": float(final["train_loss"])},
             {"metric": "final_val_loss", "value": float(final["val_loss"])},
             {"metric": "final_train_mse", "value": float(final["train_mse"])},
@@ -270,6 +319,14 @@ def train(args):
             },
             {
                 "metric": "final_val_valid_choice_loss",
+                "value": float(final["val_valid_choice_loss"]),
+            },
+            {
+                "metric": "final_train_choice_loss",
+                "value": float(final["train_valid_choice_loss"]),
+            },
+            {
+                "metric": "final_val_choice_loss",
                 "value": float(final["val_valid_choice_loss"]),
             },
         ]
@@ -319,21 +376,31 @@ def parse_args():
     p.add_argument("--arm-len", type=int, default=3)
     p.add_argument("--reward-hold-steps", type=int, default=1)
     p.add_argument("--center-hold-steps", type=int, default=0)
+    p.add_argument(
+        "--action-hold-steps",
+        type=int,
+        default=3,
+        help=(
+            "Number of center frames carrying the selected action before the "
+            "spatial trajectory must leave the center."
+        ),
+    )
     p.add_argument("--choice-order", choices=["random", "ascending"], default="random")
     p.add_argument(
         "--choice-objective",
-        choices=["exact", "valid_set"],
-        default="valid_set",
+        choices=["exact", "valid_set", "commitment"],
+        default="commitment",
         help=(
-            "exact uses the sampled one-hot choice target; valid_set accepts any "
-            "currently unvisited arm at action-selection events."
+            "exact uses the sampled one-hot target; valid_set rewards total "
+            "probability on unvisited arms; commitment reinforces the model's "
+            "preferred currently valid arm as a decisive categorical action."
         ),
     )
     p.add_argument(
         "--valid-choice-loss-weight",
         type=float,
-        default=1.0,
-        help="Multiplier on the set-valued arm-choice loss.",
+        default=0.1,
+        help="Multiplier on the valid-set or commitment arm-choice loss.",
     )
     p.add_argument("--n-arms", type=int, default=8)
     p.add_argument("--n-forced", type=int, default=4)
@@ -353,6 +420,15 @@ def parse_args():
     p.add_argument("--dt", type=float, default=0.1)
     p.add_argument("--omega", type=float, default=1.0)
     p.add_argument("--damping", type=float, default=0.2)
+    p.add_argument(
+        "--wave-readout",
+        choices=["x", "xv"],
+        default="xv",
+        help=(
+            "For Wave/FastWave, decode outputs from activity x alone or from "
+            "the full second-order state [x, v]."
+        ),
+    )
     p.add_argument("--lam", type=float, default=0.95)
     p.add_argument("--eta", type=float, default=0.1)
     p.add_argument("--beta", type=float, default=1.0)

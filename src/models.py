@@ -224,18 +224,23 @@ class WaveRNN(nn.Module):
         dt: float = 0.1,
         omega: float = 1.0,
         damping: float = 0.2,
+        readout_state: str = "x",
     ):
         super().__init__()
+        if readout_state not in {"x", "xv"}:
+            raise ValueError("readout_state must be 'x' or 'xv'")
         self.n_space = n_space
         self.channels = channels
         self.dt = dt
         self.omega = omega
         self.damping = damping
+        self.readout_state = readout_state
         hidden_dim = channels * n_space
 
         self.input_proj = nn.Linear(input_dim, hidden_dim)
         self.wave_conv = CircularDepthwiseConv1D(channels, kernel_size)
-        self.out = nn.Linear(hidden_dim, output_dim)
+        readout_dim = hidden_dim if readout_state == "x" else 2 * hidden_dim
+        self.out = nn.Linear(readout_dim, output_dim)
 
     def forward(self, u: torch.Tensor):
         # u: [B, T, input_dim]
@@ -253,7 +258,13 @@ class WaveRNN(nn.Module):
             v = v + self.dt * (-(self.omega**2) * x - self.damping * v + drive)
             x = x + self.dt * v
 
-            ys.append(self.out(x.reshape(B, -1)))
+            x_flat = x.reshape(B, -1)
+            if self.readout_state == "xv":
+                readout = torch.cat([x_flat, v.reshape(B, -1)], dim=-1)
+            else:
+                readout = x_flat
+
+            ys.append(self.out(readout))
             xs.append(x)
             vs.append(v)
 
@@ -281,6 +292,7 @@ class LocalFastWaveRNN(nn.Module):
         dt: float = 0.1,
         omega: float = 1.0,
         damping: float = 0.2,
+        readout_state: str = "x",
         lam: float = 0.95,
         eta: float = 0.1,
         beta: float = 1.0,
@@ -289,6 +301,8 @@ class LocalFastWaveRNN(nn.Module):
         super().__init__()
         if fast_update not in {"autoassoc", "transition"}:
             raise ValueError("fast_update must be 'autoassoc' or 'transition'")
+        if readout_state not in {"x", "xv"}:
+            raise ValueError("readout_state must be 'x' or 'xv'")
         self.n_space = n_space
         self.channels = channels
         self.patch_size = patch_size
@@ -296,6 +310,7 @@ class LocalFastWaveRNN(nn.Module):
         self.dt = dt
         self.omega = omega
         self.damping = damping
+        self.readout_state = readout_state
         self.lam = lam
         self.eta = eta
         self.beta = beta
@@ -305,7 +320,8 @@ class LocalFastWaveRNN(nn.Module):
         self.input_proj = nn.Linear(input_dim, hidden_dim)
         self.wave_conv = CircularDepthwiseConv1D(channels, kernel_size)
         self.fast_to_site = nn.Linear(self.patch_dim, channels)
-        self.out = nn.Linear(hidden_dim, output_dim)
+        readout_dim = hidden_dim if readout_state == "x" else 2 * hidden_dim
+        self.out = nn.Linear(readout_dim, output_dim)
 
     def forward(self, u: torch.Tensor):
         B, T, _ = u.shape
@@ -313,7 +329,7 @@ class LocalFastWaveRNN(nn.Module):
         x = torch.zeros(B, C, N, device=u.device)
         v = torch.zeros(B, C, N, device=u.device)
         F = torch.zeros(B, N, P, P, device=u.device)
-        ys, xs, f_norms, fast_drive_norms = [], [], [], []
+        ys, xs, vs, f_norms, fast_drive_norms = [], [], [], [], []
 
         for t in range(T):
             patches = local_patches_1d(x, self.patch_size)  # [B,N,P]
@@ -336,14 +352,22 @@ class LocalFastWaveRNN(nn.Module):
                 outer = torch.einsum("bni,bnj->bnij", new_patches, new_patches)
             F = self.lam * F + self.eta * outer
 
-            ys.append(self.out(x_new.reshape(B, -1)))
+            x_flat = x_new.reshape(B, -1)
+            if self.readout_state == "xv":
+                readout = torch.cat([x_flat, v.reshape(B, -1)], dim=-1)
+            else:
+                readout = x_flat
+
+            ys.append(self.out(readout))
             xs.append(x_new)
+            vs.append(v)
             f_norms.append(F.norm(dim=(2, 3)).mean(dim=1))
             fast_drive_norms.append(fast_drive.norm(dim=(1, 2)))
             x = x_new
 
         return torch.stack(ys, dim=1), {
             "wave_state": torch.stack(xs, dim=1),
+            "wave_velocity": torch.stack(vs, dim=1),
             "fast_weight_norm": torch.stack(f_norms, dim=1),
             "fast_drive_norm": torch.stack(fast_drive_norms, dim=1),
         }

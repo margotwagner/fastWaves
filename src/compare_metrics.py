@@ -21,9 +21,13 @@ EIGHT_ARM_COLS = [
     "teacher_forced_mse",
     "rollout_mse_mean",
     "final_val_valid_choice_loss",
+    "final_val_choice_loss",
     # Primary autonomous behavioral metrics. These use the model's own choices
     # and update visited history from the spatial arms it actually enters.
     "eightarm_rollout/dynamic_first_action_valid_rate",
+    "eightarm_rollout/action_selection_entropy",
+    "eightarm_rollout/action_selection_top1_probability",
+    "eightarm_rollout/action_selection_top1_top2_margin",
     "eightarm_rollout/dynamic_action_valid_unvisited_rate",
     "eightarm_rollout/dynamic_action_invalid_forced_rate",
     "eightarm_rollout/dynamic_action_reentry_rate",
@@ -35,6 +39,9 @@ EIGHT_ARM_COLS = [
     "eightarm_rollout/dynamic_unique_unvisited_arms_routed_mean",
     # Teacher-forced diagnostics separate choice-memory from routing.
     "eightarm_tf/action_selection_valid_under_teacher_history_rate",
+    "eightarm_tf/action_selection_entropy",
+    "eightarm_tf/action_selection_top1_probability",
+    "eightarm_tf/action_selection_top1_top2_margin",
     "eightarm_tf/action_selection_exact_target_arm_acc",
     "eightarm_tf/routing_exact_target_arm_acc",
     "eightarm_tf/dynamic_routing_matches_conditioning_action_rate",

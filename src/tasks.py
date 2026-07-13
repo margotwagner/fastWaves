@@ -523,8 +523,9 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         settle_steps: int = 2,
         reward_hold_steps: int = 1,
         center_hold_steps: int = 0,
+        action_hold_steps: int = 3,
         choice_order: str = "random",
-        choice_objective: str = "valid_set",
+        choice_objective: str = "commitment",
         bump_sigma: float = 0.75,
         forced_departure_weight: float = 3.0,
         choice_departure_weight: float = 10.0,
@@ -541,8 +542,12 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
             raise ValueError("arm_len must be at least 2.")
         if choice_order not in {"random", "ascending"}:
             raise ValueError("choice_order must be 'random' or 'ascending'.")
-        if choice_objective not in {"exact", "valid_set"}:
-            raise ValueError("choice_objective must be 'exact' or 'valid_set'.")
+        if choice_objective not in {"exact", "valid_set", "commitment"}:
+            raise ValueError(
+                "choice_objective must be 'exact', 'valid_set', or 'commitment'."
+            )
+        if action_hold_steps < 1:
+            raise ValueError("action_hold_steps must be at least 1.")
         if bump_sigma <= 0:
             raise ValueError("bump_sigma must be positive.")
 
@@ -555,6 +560,7 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         self.settle_steps = settle_steps
         self.reward_hold_steps = reward_hold_steps
         self.center_hold_steps = center_hold_steps
+        self.action_hold_steps = int(action_hold_steps)
         self.choice_order = choice_order
         self.choice_objective = choice_objective
         self.bump_sigma = float(bump_sigma)
@@ -587,11 +593,21 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         self.pos_dist = self._make_radial_graph_distance_matrix()
 
         # Per arm visit frames:
-        #   center(no action) -> center(action cue) -> outbound depths -> optional reward holds
-        #   -> inbound depths -> center(no action)
-        # The extra center(action cue) frame lets autonomous rollout use the predicted arm-choice
-        # channel as an input before the spatial bump has to leave the center.
-        self.visit_len = 2 + arm_len + max(0, reward_hold_steps - 1) + (arm_len - 1) + 1
+        #   center(no action) -> action_hold_steps x center(action cue)
+        #   -> outbound depths -> optional reward holds -> inbound depths
+        #   -> center(no action)
+        #
+        # Multiple action-cued center frames give second-order wave dynamics time
+        # to turn a selected action into directed motion before departure.
+        self.visit_len = (
+            1
+            + self.action_hold_steps
+            + arm_len
+            + max(0, reward_hold_steps - 1)
+            + (arm_len - 1)
+            + 1
+        )
+        self.selection_to_routing_offset = self.action_hold_steps
         natural_frames = (n_arms * self.visit_len) + settle_steps
         self.natural_seq_len = natural_frames - 1
 
@@ -704,7 +720,7 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         # In exact mode the valid masks remain available for evaluation, but the
         # training loss uses the sampled one-hot target. In valid_set mode they
         # drive the partial-label choice loss.
-        if self.choice_objective == "valid_set":
+        if self.choice_objective in {"valid_set", "commitment"}:
             self.choice_loss_masks = self.valid_choice_masks.clone()
         else:
             self.choice_loss_masks = torch.zeros_like(self.valid_choice_masks)
@@ -777,35 +793,37 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         else:
             raise ValueError(f"Unknown direction: {direction}")
 
-        # Do not set this on the center frame before departure; that would leak
-        # the correct next arm. Set it only once the trajectory is already on the selected arm.
+        # Do not set this on the first center frame before selection; that would
+        # leak the answer. After selection, the chosen action is held at center
+        # and then carried along the arm trajectory.
         if arm_choice is not None:
             frame[self.arm_choice_start + int(arm_choice)] = 1.0
 
         return frame
 
     def _visit_frames(self, arm: int, phase: str) -> list[torch.Tensor]:
-        # Two center frames are intentional:
-        #   1. center with no arm-choice cue: the memory/choice state.
-        #   2. center with arm-choice cue: the action-conditioned routing state.
-        #
-        # In teacher forcing, frame 2 teaches "given chosen arm k at center, route the
-        # spatial bump into arm k." In rollout, frame 2 is generated from frame 1,
-        # so the network must still choose the arm itself.
+        # The first center frame has no action cue and therefore requires the
+        # network to select an arm from memory. It is followed by one or more
+        # center frames carrying the selected action. Those preparation frames
+        # do not reveal the valid set; they only hold the model's chosen action
+        # long enough for the recurrent dynamics to prepare the departure.
         frames = [
             self._make_frame(
                 pos_idx=self.center_idx,
                 phase=phase,
                 direction="center",
                 arm_choice=None,
-            ),
+            )
+        ]
+        frames.extend(
             self._make_frame(
                 pos_idx=self.center_idx,
                 phase=phase,
                 direction="center",
                 arm_choice=arm,
-            ),
-        ]
+            )
+            for _ in range(self.action_hold_steps)
+        )
 
         for depth in range(self.arm_len):
             direction = "reward" if depth == self.arm_len - 1 else "outbound"
@@ -893,7 +911,7 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
             self.arm_choice_start : self.arm_choice_end,
         ] = self.arm_choice_weight
 
-        if self.choice_objective == "valid_set":
+        if self.choice_objective in {"valid_set", "commitment"}:
             # At memory-dependent selection events, several arms are correct.
             # Remove the arbitrary sampled one-hot MSE only at those events; the
             # set-valued loss in train.py replaces it. Routing and action
@@ -978,6 +996,7 @@ def build_dataset(args, n_samples, seed):
             settle_steps=getattr(args, "settle_steps", 2),
             reward_hold_steps=getattr(args, "reward_hold_steps", 1),
             center_hold_steps=getattr(args, "center_hold_steps", 0),
+            action_hold_steps=getattr(args, "action_hold_steps", 1),
             choice_order=getattr(args, "choice_order", "random"),
             choice_objective=getattr(args, "choice_objective", "valid_set"),
             bump_sigma=getattr(args, "bump_sigma", 0.75),
