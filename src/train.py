@@ -69,6 +69,9 @@ def build_model(args):
             eta=args.eta,
             beta=args.beta,
             fast_update=args.fast_update,
+            fast_write_phase=getattr(args, "fast_write_phase", "all"),
+            fast_nonwrite_mode=getattr(args, "fast_nonwrite_mode", "decay"),
+            fast_write_cue_index=getattr(args, "fast_write_cue_index", None),
         )
     raise ValueError(f"Unknown model: {args.model}")
 
@@ -198,6 +201,29 @@ def train(args):
 
     train_ds = build_dataset(args, n_samples=args.n_train, seed=args.seed)
     val_ds = build_dataset(args, n_samples=args.n_val, seed=args.seed + 1)
+
+    # Resolve the forced-phase cue from the dataset before constructing FastWave.
+    # The cue index is saved in checkpoint args, so diagnostic reconstruction is exact.
+    if (
+        args.model == "fastwave"
+        and getattr(args, "fast_write_phase", "all") == "forced"
+    ):
+        if not hasattr(train_ds, "cue_forced"):
+            raise ValueError(
+                "--fast-write-phase forced requires a task with a cue_forced "
+                "attribute, such as eight_arm_bump_traj"
+            )
+        args.fast_write_cue_index = int(train_ds.cue_forced)
+        if (
+            not hasattr(val_ds, "cue_forced")
+            or int(val_ds.cue_forced) != args.fast_write_cue_index
+        ):
+            raise RuntimeError(
+                "Training and validation datasets have inconsistent forced cues"
+            )
+    else:
+        args.fast_write_cue_index = None
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
 
@@ -291,6 +317,8 @@ def train(args):
             )
         if "fast_drive_norm" in extras:
             row["extras/fast_drive_norm_mean"] = extras["fast_drive_norm"].mean().item()
+        if "fast_write_gate" in extras:
+            row["extras/fast_write_gate_mean"] = extras["fast_write_gate"].mean().item()
         history.append(row)
 
         if epoch == 1 or epoch % args.print_every == 0:
@@ -330,7 +358,11 @@ def train(args):
                 "value": float(final["val_valid_choice_loss"]),
             },
         ]
-        for k in ["extras/fast_weight_norm_mean", "extras/fast_drive_norm_mean"]:
+        for k in [
+            "extras/fast_weight_norm_mean",
+            "extras/fast_drive_norm_mean",
+            "extras/fast_write_gate_mean",
+        ]:
             if k in final:
                 metrics.append({"metric": k, "value": float(final[k])})
         pd.DataFrame(metrics).to_csv(out_dir / "metrics.csv", index=False)
@@ -434,6 +466,24 @@ def parse_args():
     p.add_argument("--beta", type=float, default=1.0)
     p.add_argument(
         "--fast-update", choices=["autoassoc", "transition"], default="transition"
+    )
+    p.add_argument(
+        "--fast-write-phase",
+        choices=["all", "forced"],
+        default="all",
+        help=(
+            "For FastWave, update fast weights at every timestep or only when "
+            "the task's forced-phase cue is active."
+        ),
+    )
+    p.add_argument(
+        "--fast-nonwrite-mode",
+        choices=["decay", "hold"],
+        default="decay",
+        help=(
+            "Fast-memory behavior outside the permitted write phase: "
+            "'decay' applies F <- lambda F; 'hold' keeps F unchanged."
+        ),
     )
 
     p.add_argument("--epochs", type=int, default=20)

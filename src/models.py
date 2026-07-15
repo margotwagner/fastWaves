@@ -297,12 +297,23 @@ class LocalFastWaveRNN(nn.Module):
         eta: float = 0.1,
         beta: float = 1.0,
         fast_update: str = "transition",
+        fast_write_phase: str = "all",
+        fast_nonwrite_mode: str = "decay",
+        fast_write_cue_index: int | None = None,
     ):
         super().__init__()
         if fast_update not in {"autoassoc", "transition"}:
             raise ValueError("fast_update must be 'autoassoc' or 'transition'")
         if readout_state not in {"x", "xv"}:
             raise ValueError("readout_state must be 'x' or 'xv'")
+        if fast_write_phase not in {"all", "forced"}:
+            raise ValueError("fast_write_phase must be 'all' or 'forced'")
+        if fast_nonwrite_mode not in {"decay", "hold"}:
+            raise ValueError("fast_nonwrite_mode must be 'decay' or 'hold'")
+        if fast_write_phase == "forced" and fast_write_cue_index is None:
+            raise ValueError(
+                "fast_write_cue_index is required when fast_write_phase='forced'"
+            )
         self.n_space = n_space
         self.channels = channels
         self.patch_size = patch_size
@@ -315,6 +326,9 @@ class LocalFastWaveRNN(nn.Module):
         self.eta = eta
         self.beta = beta
         self.fast_update = fast_update
+        self.fast_write_phase = fast_write_phase
+        self.fast_nonwrite_mode = fast_nonwrite_mode
+        self.fast_write_cue_index = fast_write_cue_index
         hidden_dim = channels * n_space
 
         self.input_proj = nn.Linear(input_dim, hidden_dim)
@@ -323,13 +337,30 @@ class LocalFastWaveRNN(nn.Module):
         readout_dim = hidden_dim if readout_state == "x" else 2 * hidden_dim
         self.out = nn.Linear(readout_dim, output_dim)
 
+    def _fast_write_gate(self, u_t: torch.Tensor) -> torch.Tensor:
+        """Return a per-trial gate with shape [B, 1, 1, 1]."""
+        batch_size = u_t.shape[0]
+        if self.fast_write_phase == "all":
+            return u_t.new_ones(batch_size, 1, 1, 1)
+
+        if self.fast_write_cue_index is None:
+            raise RuntimeError("fast_write_cue_index was not configured")
+        if not 0 <= self.fast_write_cue_index < u_t.shape[-1]:
+            raise IndexError(
+                f"fast_write_cue_index={self.fast_write_cue_index} is outside "
+                f"input dimension {u_t.shape[-1]}"
+            )
+
+        forced = u_t[:, self.fast_write_cue_index] > 0.5
+        return forced.to(dtype=u_t.dtype).view(batch_size, 1, 1, 1)
+
     def forward(self, u: torch.Tensor):
         B, T, _ = u.shape
         C, N, P = self.channels, self.n_space, self.patch_dim
         x = torch.zeros(B, C, N, device=u.device)
         v = torch.zeros(B, C, N, device=u.device)
         F = torch.zeros(B, N, P, P, device=u.device)
-        ys, xs, vs, f_norms, fast_drive_norms = [], [], [], [], []
+        ys, xs, vs, f_norms, fast_drive_norms, write_gates = [], [], [], [], [], []
 
         for t in range(T):
             patches = local_patches_1d(x, self.patch_size)  # [B,N,P]
@@ -350,7 +381,20 @@ class LocalFastWaveRNN(nn.Module):
             else:
                 # Store local autoassociative memory of current/new patch.
                 outer = torch.einsum("bni,bnj->bnij", new_patches, new_patches)
-            F = self.lam * F + self.eta * outer
+            write_gate = self._fast_write_gate(u[:, t])
+            F_decayed = self.lam * F
+
+            if self.fast_nonwrite_mode == "decay":
+                # Outside the permitted write phase, apply only F <- lambda F.
+                F = F_decayed + write_gate * self.eta * outer
+            elif self.fast_nonwrite_mode == "hold":
+                # Outside the permitted write phase, preserve F exactly.
+                F_written = F_decayed + self.eta * outer
+                F = write_gate * F_written + (1.0 - write_gate) * F
+            else:
+                raise RuntimeError(
+                    f"Unexpected fast_nonwrite_mode: {self.fast_nonwrite_mode}"
+                )
 
             x_flat = x_new.reshape(B, -1)
             if self.readout_state == "xv":
@@ -363,6 +407,7 @@ class LocalFastWaveRNN(nn.Module):
             vs.append(v)
             f_norms.append(F.norm(dim=(2, 3)).mean(dim=1))
             fast_drive_norms.append(fast_drive.norm(dim=(1, 2)))
+            write_gates.append(write_gate[:, 0, 0, 0])
             x = x_new
 
         return torch.stack(ys, dim=1), {
@@ -370,4 +415,5 @@ class LocalFastWaveRNN(nn.Module):
             "wave_velocity": torch.stack(vs, dim=1),
             "fast_weight_norm": torch.stack(f_norms, dim=1),
             "fast_drive_norm": torch.stack(fast_drive_norms, dim=1),
+            "fast_write_gate": torch.stack(write_gates, dim=1),
         }

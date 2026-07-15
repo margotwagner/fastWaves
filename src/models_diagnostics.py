@@ -371,12 +371,23 @@ class LocalFastWaveRNN(nn.Module):
         eta: float = 0.1,
         beta: float = 1.0,
         fast_update: str = "transition",
+        fast_write_phase: str = "all",
+        fast_nonwrite_mode: str = "decay",
+        fast_write_cue_index: int | None = None,
     ):
         super().__init__()
         if fast_update not in {"autoassoc", "transition"}:
             raise ValueError("fast_update must be 'autoassoc' or 'transition'")
         if readout_state not in {"x", "xv"}:
             raise ValueError("readout_state must be 'x' or 'xv'")
+        if fast_write_phase not in {"all", "forced"}:
+            raise ValueError("fast_write_phase must be 'all' or 'forced'")
+        if fast_nonwrite_mode not in {"decay", "hold"}:
+            raise ValueError("fast_nonwrite_mode must be 'decay' or 'hold'")
+        if fast_write_phase == "forced" and fast_write_cue_index is None:
+            raise ValueError(
+                "fast_write_cue_index is required when fast_write_phase='forced'"
+            )
         self.n_space = n_space
         self.channels = channels
         self.patch_size = patch_size
@@ -389,6 +400,9 @@ class LocalFastWaveRNN(nn.Module):
         self.eta = eta
         self.beta = beta
         self.fast_update = fast_update
+        self.fast_write_phase = fast_write_phase
+        self.fast_nonwrite_mode = fast_nonwrite_mode
+        self.fast_write_cue_index = fast_write_cue_index
         hidden_dim = channels * n_space
 
         self.input_proj = nn.Linear(input_dim, hidden_dim)
@@ -396,6 +410,23 @@ class LocalFastWaveRNN(nn.Module):
         self.fast_to_site = nn.Linear(self.patch_dim, channels)
         readout_dim = hidden_dim if readout_state == "x" else 2 * hidden_dim
         self.out = nn.Linear(readout_dim, output_dim)
+
+    def _fast_write_gate(self, u_t: torch.Tensor) -> torch.Tensor:
+        """Return a per-trial gate with shape [B, 1, 1, 1]."""
+        batch_size = u_t.shape[0]
+        if self.fast_write_phase == "all":
+            return u_t.new_ones(batch_size, 1, 1, 1)
+
+        if self.fast_write_cue_index is None:
+            raise RuntimeError("fast_write_cue_index was not configured")
+        if not 0 <= self.fast_write_cue_index < u_t.shape[-1]:
+            raise IndexError(
+                f"fast_write_cue_index={self.fast_write_cue_index} is outside "
+                f"input dimension {u_t.shape[-1]}"
+            )
+
+        forced = u_t[:, self.fast_write_cue_index] > 0.5
+        return forced.to(dtype=u_t.dtype).view(batch_size, 1, 1, 1)
 
     def initial_state(self, batch_size: int, reference: torch.Tensor):
         C, N, P = self.channels, self.n_space, self.patch_dim
@@ -444,14 +475,25 @@ class LocalFastWaveRNN(nn.Module):
         x_new = x + self.dt * v_new
 
         new_patches = local_patches_1d(x_new, self.patch_size)
-        if t >= start_t and intervention.get("disable_fast_write_after", False):
-            F_next = self.lam * F_read
+        if self.fast_update == "transition":
+            outer = torch.einsum("bni,bnj->bnij", new_patches, patches)
         else:
-            if self.fast_update == "transition":
-                outer = torch.einsum("bni,bnj->bnij", new_patches, patches)
-            else:
-                outer = torch.einsum("bni,bnj->bnij", new_patches, new_patches)
-            F_next = self.lam * F_read + self.eta * outer
+            outer = torch.einsum("bni,bnj->bnij", new_patches, new_patches)
+
+        write_gate = self._fast_write_gate(u_t)
+        if t >= start_t and intervention.get("disable_fast_write_after", False):
+            write_gate = torch.zeros_like(write_gate)
+
+        F_decayed = self.lam * F_read
+        if self.fast_nonwrite_mode == "decay":
+            F_next = F_decayed + write_gate * self.eta * outer
+        elif self.fast_nonwrite_mode == "hold":
+            F_written = F_decayed + self.eta * outer
+            F_next = write_gate * F_written + (1.0 - write_gate) * F_read
+        else:
+            raise RuntimeError(
+                f"Unexpected fast_nonwrite_mode: {self.fast_nonwrite_mode}"
+            )
 
         x_flat = x_new.reshape(u_t.shape[0], -1)
         if self.readout_state == "xv":
@@ -472,6 +514,7 @@ class LocalFastWaveRNN(nn.Module):
             "retrieved": retrieved,
             "fast_drive_raw": fast_drive_raw,
             "fast_drive_applied": fast_drive,
+            "fast_write_gate": write_gate[:, 0, 0, 0],
         }
         return y_t, new_state, aux
 
@@ -486,7 +529,7 @@ class LocalFastWaveRNN(nn.Module):
         state = self.initial_state(B, u)
         selected = set(range(T)) if record_all else set(record_times or [])
 
-        ys, xs, vs, f_norms, fast_drive_norms = [], [], [], [], []
+        ys, xs, vs, f_norms, fast_drive_norms, write_gates = [], [], [], [], [], []
         diag_times = []
         diagnostic = {
             "wave_state_pre": [],
@@ -497,6 +540,7 @@ class LocalFastWaveRNN(nn.Module):
             "fast_retrieved": [],
             "fast_drive_raw": [],
             "fast_drive_applied": [],
+            "fast_write_gate": [],
         }
 
         for t in range(T):
@@ -510,6 +554,7 @@ class LocalFastWaveRNN(nn.Module):
             fast_drive_norms.append(
                 step_aux["fast_drive_applied"].norm(dim=(1, 2))
             )
+            write_gates.append(step_aux["fast_write_gate"])
 
             if t in selected:
                 diag_times.append(t)
@@ -522,6 +567,7 @@ class LocalFastWaveRNN(nn.Module):
                     "fast_retrieved": step_aux["retrieved"],
                     "fast_drive_raw": step_aux["fast_drive_raw"],
                     "fast_drive_applied": step_aux["fast_drive_applied"],
+                    "fast_write_gate": step_aux["fast_write_gate"],
                 }
                 for key, value in values.items():
                     diagnostic[key].append(value.detach().cpu())
@@ -531,6 +577,7 @@ class LocalFastWaveRNN(nn.Module):
             "wave_velocity": torch.stack(vs, dim=1),
             "fast_weight_norm": torch.stack(f_norms, dim=1),
             "fast_drive_norm": torch.stack(fast_drive_norms, dim=1),
+            "fast_write_gate": torch.stack(write_gates, dim=1),
         }
         if diag_times:
             extras["diagnostic_times"] = torch.tensor(diag_times, dtype=torch.long)
