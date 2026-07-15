@@ -75,6 +75,7 @@ def eight_arm_traj_metrics(
     dataset,
     prefix="eightarm",
     rollout_mode=False,
+    raw_action_yhat=None,
 ):
     """Task-specific metrics for the eight-arm trajectory tasks.
 
@@ -182,7 +183,12 @@ def eight_arm_traj_metrics(
 
     a0 = int(dataset.arm_choice_start)
     a1 = int(dataset.arm_choice_end)
-    pred_action_arm = yhat[:, :, a0:a1].argmax(dim=-1)
+
+    # During autonomous rollout, action outputs may be hardened to one-hot only
+    # for feedback into the next timestep. Behavioral choices and confidence
+    # metrics must use the model's raw pre-hardening logits.
+    action_source = yhat if raw_action_yhat is None else raw_action_yhat
+    pred_action_arm = action_source[:, :, a0:a1].argmax(dim=-1)
     true_action_arm = y[:, :, a0:a1].argmax(dim=-1)
     true_action_active = y[:, :, a0:a1].sum(dim=-1) > 0.5
     x_action_active = x[:, :, a0:a1].sum(dim=-1) > 0.5
@@ -208,7 +214,7 @@ def eight_arm_traj_metrics(
     )
 
     action_exact = pred_action_arm.eq(true_action_arm)
-    action_logits = yhat[:, :, a0:a1]
+    action_logits = action_source[:, :, a0:a1]
     action_mse = F.mse_loss(
         action_logits, y[:, :, a0:a1], reduction="none"
     ).mean(dim=-1)
@@ -391,6 +397,7 @@ def eight_arm_choice_debug_rows(
     dataset,
     split_name="rollout",
     max_trials=16,
+    raw_action_yhat=None,
 ):
     """Return per-choice rows using the model's actual action and route."""
     if not hasattr(dataset, "valid_choice_masks"):
@@ -406,7 +413,8 @@ def eight_arm_choice_debug_rows(
 
     pred_pos = yhat[:, :, :n_pos].argmax(dim=-1)
     true_pos = y[:, :, :n_pos].argmax(dim=-1)
-    pred_action = yhat[:, :, a0:a1].argmax(dim=-1)
+    action_source = yhat if raw_action_yhat is None else raw_action_yhat
+    pred_action = action_source[:, :, a0:a1].argmax(dim=-1)
     true_action = y[:, :, a0:a1].argmax(dim=-1)
 
     def pos_to_arm(pos):
@@ -444,7 +452,7 @@ def eight_arm_choice_debug_rows(
             route_matches_conditioning = departed and spatial_arm == conditioning_action
             route_matches_selected = departed and spatial_arm == selected
 
-            probs = torch.softmax(yhat[b, t, a0:a1], dim=-1)
+            probs = torch.softmax(action_source[b, t, a0:a1], dim=-1)
             top_vals, top_idx = torch.topk(probs, k=min(4, n_arms))
             entropy = float(
                 -(probs * torch.log(probs.clamp_min(1e-8))).sum().item()
@@ -518,12 +526,13 @@ def write_eight_arm_choice_debug(
 
     with torch.no_grad():
         yhat_tf, _ = model(x)
-        yhat_roll = autonomous_rollout(
+        yhat_roll, yhat_roll_raw = autonomous_rollout(
             model,
             x,
             prefix_len=prefix_len,
             dataset=dataset,
             hard_action_choices=hard_action_choices,
+            return_raw=True,
         )
 
     rows = []
@@ -545,6 +554,7 @@ def write_eight_arm_choice_debug(
             dataset=dataset,
             split_name="rollout",
             max_trials=max_trials,
+            raw_action_yhat=yhat_roll_raw,
         )
     )
 
@@ -586,12 +596,13 @@ def rollout_eight_arm_eval(
     model.eval()
     x = dataset.x.to(device)
     y = dataset.y.to(device)
-    yhat = autonomous_rollout(
+    yhat, yhat_raw = autonomous_rollout(
         model,
         x,
         prefix_len=prefix_len,
         dataset=dataset,
         hard_action_choices=hard_action_choices,
+        return_raw=True,
     )
     return eight_arm_traj_metrics(
         yhat=yhat,
@@ -600,6 +611,7 @@ def rollout_eight_arm_eval(
         dataset=dataset,
         prefix="eightarm_rollout",
         rollout_mode=True,
+        raw_action_yhat=yhat_raw,
     )
 
 
@@ -668,6 +680,7 @@ def autonomous_rollout(
     prefix_len,
     dataset=None,
     hard_action_choices=True,
+    return_raw=False,
 ):
     """Autoregressive rollout with optional discrete arm decisions.
 
@@ -681,6 +694,7 @@ def autonomous_rollout(
     _, T, _ = x.shape
     u_roll = x.clone()
     preds = []
+    raw_preds = []
 
     selection_schedule = None
     a0 = a1 = None
@@ -699,22 +713,30 @@ def autonomous_rollout(
     with torch.no_grad():
         for t in range(T):
             yhat_prefix, _ = model(u_roll[:, : t + 1, :])
-            pred_t = yhat_prefix[:, -1, :]
+            raw_pred_t = yhat_prefix[:, -1, :]
+            feedback_pred_t = raw_pred_t
+
+            # Preserve the model's actual logits for confidence and choice
+            # analysis. Harden only the copy that is fed back for routing.
+            raw_preds.append(raw_pred_t)
 
             if selection_schedule is not None:
                 active_rows = torch.where(selection_schedule[:, t])[0]
                 if len(active_rows) > 0:
-                    pred_t = pred_t.clone()
-                    choices = pred_t[active_rows, a0:a1].argmax(dim=-1)
-                    pred_t[active_rows, a0:a1] = 0.0
-                    pred_t[active_rows, a0 + choices] = 1.0
+                    feedback_pred_t = raw_pred_t.clone()
+                    choices = raw_pred_t[active_rows, a0:a1].argmax(dim=-1)
+                    feedback_pred_t[active_rows, a0:a1] = 0.0
+                    feedback_pred_t[active_rows, a0 + choices] = 1.0
 
-            preds.append(pred_t)
+            preds.append(feedback_pred_t)
 
             if t + 1 < T and t + 1 >= prefix_len:
-                u_roll[:, t + 1, :] = pred_t
+                u_roll[:, t + 1, :] = feedback_pred_t
 
-    return torch.stack(preds, dim=1)
+    feedback = torch.stack(preds, dim=1)
+    if return_raw:
+        return feedback, torch.stack(raw_preds, dim=1)
+    return feedback
 
 
 def rollout_eval_and_plots(
@@ -729,14 +751,17 @@ def rollout_eval_and_plots(
     x = dataset.x.to(device)
     y = dataset.y.to(device)
 
-    yhat = autonomous_rollout(
+    _, yhat = autonomous_rollout(
         model,
         x,
         prefix_len=prefix_len,
         dataset=dataset,
         hard_action_choices=hard_action_choices,
+        return_raw=True,
     )
 
+    # Plot and score the model's raw outputs. The underlying trajectory was
+    # still generated using hardened categorical actions when requested.
     mse_t = F.mse_loss(yhat, y, reduction="none").mean(dim=(0, 2)).cpu().numpy()
 
     pred_ang, pred_pos = circular_decode(yhat)
