@@ -71,6 +71,9 @@ def build_diagnostic_model(args):
             fast_write_phase=getattr(args, "fast_write_phase", "all"),
             fast_nonwrite_mode=getattr(args, "fast_nonwrite_mode", "decay"),
             fast_write_cue_index=getattr(args, "fast_write_cue_index", None),
+            fast_write_reward_cue_index=getattr(
+                args, "fast_write_reward_cue_index", None
+            ),
         )
     raise ValueError("Use a Wave or FastWave checkpoint")
 

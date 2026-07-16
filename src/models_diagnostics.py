@@ -374,19 +374,27 @@ class LocalFastWaveRNN(nn.Module):
         fast_write_phase: str = "all",
         fast_nonwrite_mode: str = "decay",
         fast_write_cue_index: int | None = None,
+        fast_write_reward_cue_index: int | None = None,
     ):
         super().__init__()
         if fast_update not in {"autoassoc", "transition"}:
             raise ValueError("fast_update must be 'autoassoc' or 'transition'")
         if readout_state not in {"x", "xv"}:
             raise ValueError("readout_state must be 'x' or 'xv'")
-        if fast_write_phase not in {"all", "forced"}:
-            raise ValueError("fast_write_phase must be 'all' or 'forced'")
+        if fast_write_phase not in {"all", "forced", "forced_reward"}:
+            raise ValueError(
+                "fast_write_phase must be 'all', 'forced', or 'forced_reward'"
+            )
         if fast_nonwrite_mode not in {"decay", "hold"}:
             raise ValueError("fast_nonwrite_mode must be 'decay' or 'hold'")
-        if fast_write_phase == "forced" and fast_write_cue_index is None:
+        if fast_write_phase in {"forced", "forced_reward"} and fast_write_cue_index is None:
             raise ValueError(
-                "fast_write_cue_index is required when fast_write_phase='forced'"
+                "fast_write_cue_index is required for forced-gated writing"
+            )
+        if fast_write_phase == "forced_reward" and fast_write_reward_cue_index is None:
+            raise ValueError(
+                "fast_write_reward_cue_index is required when "
+                "fast_write_phase='forced_reward'"
             )
         self.n_space = n_space
         self.channels = channels
@@ -403,6 +411,7 @@ class LocalFastWaveRNN(nn.Module):
         self.fast_write_phase = fast_write_phase
         self.fast_nonwrite_mode = fast_nonwrite_mode
         self.fast_write_cue_index = fast_write_cue_index
+        self.fast_write_reward_cue_index = fast_write_reward_cue_index
         hidden_dim = channels * n_space
 
         self.input_proj = nn.Linear(input_dim, hidden_dim)
@@ -426,7 +435,20 @@ class LocalFastWaveRNN(nn.Module):
             )
 
         forced = u_t[:, self.fast_write_cue_index] > 0.5
-        return forced.to(dtype=u_t.dtype).view(batch_size, 1, 1, 1)
+        write = forced
+
+        if self.fast_write_phase == "forced_reward":
+            if self.fast_write_reward_cue_index is None:
+                raise RuntimeError("fast_write_reward_cue_index was not configured")
+            if not 0 <= self.fast_write_reward_cue_index < u_t.shape[-1]:
+                raise IndexError(
+                    f"fast_write_reward_cue_index={self.fast_write_reward_cue_index} "
+                    f"is outside input dimension {u_t.shape[-1]}"
+                )
+            reward = u_t[:, self.fast_write_reward_cue_index] > 0.5
+            write = forced | reward
+
+        return write.to(dtype=u_t.dtype).view(batch_size, 1, 1, 1)
 
     def initial_state(self, batch_size: int, reference: torch.Tensor):
         C, N, P = self.channels, self.n_space, self.patch_dim

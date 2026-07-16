@@ -72,6 +72,9 @@ def build_model(args):
             fast_write_phase=getattr(args, "fast_write_phase", "all"),
             fast_nonwrite_mode=getattr(args, "fast_nonwrite_mode", "decay"),
             fast_write_cue_index=getattr(args, "fast_write_cue_index", None),
+            fast_write_reward_cue_index=getattr(
+                args, "fast_write_reward_cue_index", None
+            ),
         )
     raise ValueError(f"Unknown model: {args.model}")
 
@@ -202,16 +205,14 @@ def train(args):
     train_ds = build_dataset(args, n_samples=args.n_train, seed=args.seed)
     val_ds = build_dataset(args, n_samples=args.n_val, seed=args.seed + 1)
 
-    # Resolve the forced-phase cue from the dataset before constructing FastWave.
-    # The cue index is saved in checkpoint args, so diagnostic reconstruction is exact.
-    if (
-        args.model == "fastwave"
-        and getattr(args, "fast_write_phase", "all") == "forced"
-    ):
+    # Resolve task cue indices before constructing FastWave. The indices are
+    # saved in checkpoint args so diagnostic reconstruction remains exact.
+    write_phase = getattr(args, "fast_write_phase", "all")
+    if args.model == "fastwave" and write_phase in {"forced", "forced_reward"}:
         if not hasattr(train_ds, "cue_forced"):
             raise ValueError(
-                "--fast-write-phase forced requires a task with a cue_forced "
-                "attribute, such as eight_arm_bump_traj"
+                f"--fast-write-phase {write_phase} requires a task with a "
+                "cue_forced attribute, such as eight_arm_bump_traj"
             )
         args.fast_write_cue_index = int(train_ds.cue_forced)
         if (
@@ -223,6 +224,23 @@ def train(args):
             )
     else:
         args.fast_write_cue_index = None
+
+    if args.model == "fastwave" and write_phase == "forced_reward":
+        if not hasattr(train_ds, "cue_reward"):
+            raise ValueError(
+                "--fast-write-phase forced_reward requires a task with a "
+                "cue_reward attribute, such as eight_arm_bump_traj"
+            )
+        args.fast_write_reward_cue_index = int(train_ds.cue_reward)
+        if (
+            not hasattr(val_ds, "cue_reward")
+            or int(val_ds.cue_reward) != args.fast_write_reward_cue_index
+        ):
+            raise RuntimeError(
+                "Training and validation datasets have inconsistent reward cues"
+            )
+    else:
+        args.fast_write_reward_cue_index = None
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
@@ -469,11 +487,11 @@ def parse_args():
     )
     p.add_argument(
         "--fast-write-phase",
-        choices=["all", "forced"],
+        choices=["all", "forced", "forced_reward"],
         default="all",
         help=(
-            "For FastWave, update fast weights at every timestep or only when "
-            "the task's forced-phase cue is active."
+            "For FastWave, update fast weights at every timestep, during the "
+            "forced phase only, or during the forced phase plus reward events."
         ),
     )
     p.add_argument(

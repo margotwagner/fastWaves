@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that a forced-only FastWave checkpoint writes only in forced frames."""
+"""Verify FastWave write gates against the task's phase/reward cues."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.tasks import build_dataset
-from src.train import build_model
+from src.tasks import build_dataset  # noqa: E402
+from src.train import build_model  # noqa: E402
 
 
 def safe_load(path: str, device: torch.device):
@@ -47,27 +47,42 @@ def main() -> None:
     if "fast_write_gate" not in extras:
         raise RuntimeError("Checkpoint/model did not return fast_write_gate")
 
-    gate = extras["fast_write_gate"][0].detach().cpu()
-    expected_end = int(dataset.n_forced * dataset.visit_len)
-    expected = torch.zeros_like(gate)
-    expected[:expected_end] = 1.0
+    gate = extras["fast_write_gate"][0].detach().cpu() > 0.5
+    x = dataset.x[0]
+    phase = getattr(train_args, "fast_write_phase", "all")
 
-    print(f"fast_write_phase: {getattr(train_args, 'fast_write_phase', 'all')}")
-    print(f"fast_nonwrite_mode: {getattr(train_args, 'fast_nonwrite_mode', 'decay')}")
-    print(f"fast_write_cue_index: {getattr(train_args, 'fast_write_cue_index', None)}")
-    print(f"forced input frames: 0..{expected_end - 1}")
-    print(f"gate sum: {int(gate.sum().item())} / {len(gate)}")
-    print("gate:", "".join("1" if value > 0.5 else "0" for value in gate.tolist()))
-
-    if getattr(train_args, "fast_write_phase", "all") == "forced":
-        if not torch.equal(gate, expected):
-            mismatch = torch.where(gate != expected)[0].tolist()
-            raise RuntimeError(f"Unexpected write gate at timesteps: {mismatch}")
-        print("PASS: writing is active only during the forced phase.")
+    if phase == "all":
+        expected = torch.ones_like(gate)
+    elif phase == "forced":
+        expected = x[:, dataset.cue_forced] > 0.5
+    elif phase == "forced_reward":
+        expected = (x[:, dataset.cue_forced] > 0.5) | (
+            x[:, dataset.cue_reward] > 0.5
+        )
     else:
-        if not torch.all(gate == 1):
-            raise RuntimeError("All-write checkpoint did not write at every timestep")
-        print("PASS: writing is active at every timestep.")
+        raise ValueError(f"Unknown fast_write_phase: {phase}")
+
+    print(f"fast_write_phase: {phase}")
+    print(f"fast_nonwrite_mode: {getattr(train_args, 'fast_nonwrite_mode', 'decay')}")
+    print(f"forced cue index: {getattr(train_args, 'fast_write_cue_index', None)}")
+    print(
+        "reward cue index: "
+        f"{getattr(train_args, 'fast_write_reward_cue_index', None)}"
+    )
+    print(f"gate sum: {int(gate.sum().item())} / {len(gate)}")
+    print("gate:    ", "".join("1" if z else "0" for z in gate.tolist()))
+    print("expected:", "".join("1" if z else "0" for z in expected.tolist()))
+
+    if not torch.equal(gate, expected):
+        mismatch = torch.where(gate != expected)[0].tolist()
+        raise RuntimeError(f"Unexpected write gate at timesteps: {mismatch}")
+
+    reward_only = (
+        (x[:, dataset.cue_reward] > 0.5)
+        & ~(x[:, dataset.cue_forced] > 0.5)
+    )
+    print(f"choice reward write events: {int(reward_only.sum().item())}")
+    print("PASS: the write gate matches the configured schedule.")
 
 
 if __name__ == "__main__":
