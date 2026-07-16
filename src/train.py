@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 
 from src.models import (
     VanillaRNN,
+    GRURNN,
     WaveRNN,
     GlobalFastRNN,
     LocalFastRNN,
@@ -17,7 +18,19 @@ from src.tasks import build_dataset
 
 def build_model(args):
     if args.model == "vanilla":
-        return VanillaRNN(args.n_space, args.hidden_dim, args.n_space)
+        return VanillaRNN(
+            args.n_space,
+            args.hidden_dim,
+            args.n_space,
+            state_reset_cue_index=getattr(args, "state_reset_cue_index", None),
+        )
+    if args.model == "gru":
+        return GRURNN(
+            args.n_space,
+            args.hidden_dim,
+            args.n_space,
+            state_reset_cue_index=getattr(args, "state_reset_cue_index", None),
+        )
     if args.model == "globalfast":
         return GlobalFastRNN(
             input_dim=args.n_space,
@@ -39,6 +52,7 @@ def build_model(args):
             omega=args.omega,
             damping=args.damping,
             readout_state=getattr(args, "wave_readout", "x"),
+            state_reset_cue_index=getattr(args, "state_reset_cue_index", None),
         )
     if args.model == "localfast":
         return LocalFastRNN(
@@ -75,28 +89,57 @@ def build_model(args):
             fast_write_reward_cue_index=getattr(
                 args, "fast_write_reward_cue_index", None
             ),
+            state_reset_cue_index=getattr(args, "state_reset_cue_index", None),
+            fast_patch_norm=getattr(args, "fast_patch_norm", "none"),
+            fast_readout_bias=getattr(args, "fast_readout_bias", True),
         )
     raise ValueError(f"Unknown model: {args.model}")
 
 
 
 def unpack_batch(batch, device):
-    """Support datasets returning 2, 3, or 4 tensors."""
+    """Normalize the supported dataset tuple formats."""
+    result = {
+        "x": None,
+        "y": None,
+        "weights": None,
+        "valid_choice_masks": None,
+        "successor_targets": None,
+        "successor_query_masks": None,
+    }
+
+    if len(batch) == 5:
+        x, y, weights, successor_targets, successor_query_masks = batch
+        result.update(
+            x=x.to(device),
+            y=y.to(device),
+            weights=weights.to(device),
+            successor_targets=successor_targets.to(device),
+            successor_query_masks=successor_query_masks.to(device),
+        )
+        return result
+
     if len(batch) == 4:
         x, y, weights, valid_choice_masks = batch
-        return (
-            x.to(device),
-            y.to(device),
-            weights.to(device),
-            valid_choice_masks.to(device),
+        result.update(
+            x=x.to(device),
+            y=y.to(device),
+            weights=weights.to(device),
+            valid_choice_masks=valid_choice_masks.to(device),
         )
+        return result
+
     if len(batch) == 3:
         x, y, weights = batch
-        return x.to(device), y.to(device), weights.to(device), None
+        result.update(x=x.to(device), y=y.to(device), weights=weights.to(device))
+        return result
+
     if len(batch) == 2:
         x, y = batch
-        return x.to(device), y.to(device), None, None
-    raise ValueError(f"Expected batch length 2, 3, or 4, got {len(batch)}")
+        result.update(x=x.to(device), y=y.to(device))
+        return result
+
+    raise ValueError(f"Expected batch length 2, 3, 4, or 5, got {len(batch)}")
 
 
 def sequence_mse_loss(yhat, y, weights=None):
@@ -196,6 +239,29 @@ def compute_choice_loss(
     raise ValueError(f"Unknown choice_objective: {choice_objective}")
 
 
+def successor_recall_loss_and_accuracy(
+    yhat,
+    successor_targets,
+    successor_query_masks,
+    dataset,
+):
+    """Exact eight-way successor classification at the query readout step."""
+    if successor_targets is None or successor_query_masks is None:
+        raise ValueError("Successor task batch is missing targets or query masks")
+
+    logits_all = yhat[..., dataset.arm_choice_start : dataset.arm_choice_end]
+    active_logits = logits_all[successor_query_masks.bool()]
+    if active_logits.shape[0] != successor_targets.shape[0]:
+        raise RuntimeError(
+            "Expected exactly one active successor query per trial, but got "
+            f"{active_logits.shape[0]} logits for {successor_targets.shape[0]} trials"
+        )
+    loss = F.cross_entropy(active_logits, successor_targets.long())
+    accuracy = active_logits.argmax(dim=-1).eq(successor_targets).float().mean()
+    return loss, accuracy
+
+
+
 def train(args):
     torch.manual_seed(args.seed)
     device = torch.device(
@@ -209,18 +275,22 @@ def train(args):
     # saved in checkpoint args so diagnostic reconstruction remains exact.
     write_phase = getattr(args, "fast_write_phase", "all")
     if args.model == "fastwave" and write_phase in {"forced", "forced_reward"}:
-        if not hasattr(train_ds, "cue_forced"):
+        write_attr = (
+            "fast_write_cue"
+            if hasattr(train_ds, "fast_write_cue")
+            else "cue_forced"
+        )
+        if not hasattr(train_ds, write_attr):
             raise ValueError(
-                f"--fast-write-phase {write_phase} requires a task with a "
-                "cue_forced attribute, such as eight_arm_bump_traj"
+                f"--fast-write-phase {write_phase} requires a dataset write cue"
             )
-        args.fast_write_cue_index = int(train_ds.cue_forced)
+        args.fast_write_cue_index = int(getattr(train_ds, write_attr))
         if (
-            not hasattr(val_ds, "cue_forced")
-            or int(val_ds.cue_forced) != args.fast_write_cue_index
+            not hasattr(val_ds, write_attr)
+            or int(getattr(val_ds, write_attr)) != args.fast_write_cue_index
         ):
             raise RuntimeError(
-                "Training and validation datasets have inconsistent forced cues"
+                "Training and validation datasets have inconsistent write cues"
             )
     else:
         args.fast_write_cue_index = None
@@ -242,6 +312,18 @@ def train(args):
     else:
         args.fast_write_reward_cue_index = None
 
+    if hasattr(train_ds, "state_reset_cue"):
+        args.state_reset_cue_index = int(train_ds.state_reset_cue)
+        if (
+            not hasattr(val_ds, "state_reset_cue")
+            or int(val_ds.state_reset_cue) != args.state_reset_cue_index
+        ):
+            raise RuntimeError(
+                "Training and validation datasets have inconsistent reset cues"
+            )
+    else:
+        args.state_reset_cue_index = None
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
 
@@ -259,19 +341,36 @@ def train(args):
         train_loss = 0.0
         train_mse = 0.0
         train_choice = 0.0
+        train_successor_correct = 0.0
         for batch in train_loader:
-            x, y, weights, valid_choice_masks = unpack_batch(batch, device)
+            unpacked = unpack_batch(batch, device)
+            x = unpacked["x"]
+            y = unpacked["y"]
+            weights = unpacked["weights"]
+            valid_choice_masks = unpacked["valid_choice_masks"]
             opt.zero_grad(set_to_none=True)
             yhat, extras = model(x)
 
-            mse_loss = sequence_mse_loss(yhat, y, weights)
-            choice_loss = compute_choice_loss(
-                yhat=yhat,
-                valid_choice_masks=valid_choice_masks,
-                dataset=train_ds,
-                choice_objective=getattr(args, "choice_objective", "exact"),
-            )
-            loss = mse_loss + args.valid_choice_loss_weight * choice_loss
+            if args.task in {"eight_arm_successor", "eight_arm_transition_recall"}:
+                successor_loss, successor_acc = successor_recall_loss_and_accuracy(
+                    yhat=yhat,
+                    successor_targets=unpacked["successor_targets"],
+                    successor_query_masks=unpacked["successor_query_masks"],
+                    dataset=train_ds,
+                )
+                mse_loss = yhat.new_zeros(())
+                choice_loss = successor_loss
+                loss = successor_loss
+            else:
+                successor_acc = yhat.new_zeros(())
+                mse_loss = sequence_mse_loss(yhat, y, weights)
+                choice_loss = compute_choice_loss(
+                    yhat=yhat,
+                    valid_choice_masks=valid_choice_masks,
+                    dataset=train_ds,
+                    choice_objective=getattr(args, "choice_objective", "exact"),
+                )
+                loss = mse_loss + args.valid_choice_loss_weight * choice_loss
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -281,37 +380,58 @@ def train(args):
             train_loss += loss.item() * batch_n
             train_mse += mse_loss.item() * batch_n
             train_choice += choice_loss.item() * batch_n
+            train_successor_correct += successor_acc.item() * batch_n
 
         train_loss /= len(train_ds)
         train_mse /= len(train_ds)
         train_choice /= len(train_ds)
+        train_successor_acc = train_successor_correct / len(train_ds)
 
         model.eval()
         val_loss = 0.0
         val_mse = 0.0
         val_choice = 0.0
+        val_successor_correct = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                x, y, weights, valid_choice_masks = unpack_batch(batch, device)
+                unpacked = unpack_batch(batch, device)
+                x = unpacked["x"]
+                y = unpacked["y"]
+                weights = unpacked["weights"]
+                valid_choice_masks = unpacked["valid_choice_masks"]
                 yhat, extras = model(x)
 
-                mse_loss = sequence_mse_loss(yhat, y, weights)
-                choice_loss = compute_choice_loss(
-                    yhat=yhat,
-                    valid_choice_masks=valid_choice_masks,
-                    dataset=val_ds,
-                    choice_objective=getattr(args, "choice_objective", "exact"),
-                )
-                loss = mse_loss + args.valid_choice_loss_weight * choice_loss
+                if args.task in {"eight_arm_successor", "eight_arm_transition_recall"}:
+                    successor_loss, successor_acc = successor_recall_loss_and_accuracy(
+                        yhat=yhat,
+                        successor_targets=unpacked["successor_targets"],
+                        successor_query_masks=unpacked["successor_query_masks"],
+                        dataset=val_ds,
+                    )
+                    mse_loss = yhat.new_zeros(())
+                    choice_loss = successor_loss
+                    loss = successor_loss
+                else:
+                    successor_acc = yhat.new_zeros(())
+                    mse_loss = sequence_mse_loss(yhat, y, weights)
+                    choice_loss = compute_choice_loss(
+                        yhat=yhat,
+                        valid_choice_masks=valid_choice_masks,
+                        dataset=val_ds,
+                        choice_objective=getattr(args, "choice_objective", "exact"),
+                    )
+                    loss = mse_loss + args.valid_choice_loss_weight * choice_loss
 
                 batch_n = x.size(0)
                 val_loss += loss.item() * batch_n
                 val_mse += mse_loss.item() * batch_n
                 val_choice += choice_loss.item() * batch_n
+                val_successor_correct += successor_acc.item() * batch_n
 
         val_loss /= len(val_ds)
         val_mse /= len(val_ds)
         val_choice /= len(val_ds)
+        val_successor_acc = val_successor_correct / len(val_ds)
 
         if val_loss < best_val:
             best_val = val_loss
@@ -328,6 +448,8 @@ def train(args):
             "val_mse": val_mse,
             "train_valid_choice_loss": train_choice,
             "val_valid_choice_loss": val_choice,
+            "train_successor_accuracy": train_successor_acc,
+            "val_successor_accuracy": val_successor_acc,
         }
         if "fast_weight_norm" in extras:
             row["extras/fast_weight_norm_mean"] = (
@@ -344,6 +466,8 @@ def train(args):
                 f"epoch {epoch:04d} | train {train_loss:.6f} | val {val_loss:.6f}"
                 f" | mse {val_mse:.6f} | choice {val_choice:.6f}"
             )
+            if args.task in {"eight_arm_successor", "eight_arm_transition_recall"}:
+                msg += f" | successor_acc {val_successor_acc:.4f}"
             if "fast_weight_norm" in extras:
                 msg += f" | F_norm {extras['fast_weight_norm'].mean().item():.4f}"
             print(msg)
@@ -375,6 +499,14 @@ def train(args):
                 "metric": "final_val_choice_loss",
                 "value": float(final["val_valid_choice_loss"]),
             },
+            {
+                "metric": "train_successor_accuracy",
+                "value": float(final["train_successor_accuracy"]),
+            },
+            {
+                "metric": "val_successor_accuracy",
+                "value": float(final["val_successor_accuracy"]),
+            },
         ]
         for k in [
             "extras/fast_weight_norm_mean",
@@ -394,7 +526,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--model",
-        choices=["vanilla", "wave", "globalfast", "localfast", "fastwave"],
+        choices=["vanilla", "gru", "wave", "globalfast", "localfast", "fastwave"],
         default="fastwave",
     )
     p.add_argument("--seed", type=int, default=42)
@@ -409,6 +541,8 @@ def parse_args():
             "eight_arm",
             "eight_arm_traj",
             "eight_arm_bump_traj",
+            "eight_arm_successor",
+            "eight_arm_transition_recall",
         ],
         default="ring",
     )
@@ -454,6 +588,61 @@ def parse_args():
     )
     p.add_argument("--n-arms", type=int, default=8)
     p.add_argument("--n-forced", type=int, default=4)
+    p.add_argument(
+        "--successor-seq-length",
+        type=int,
+        default=4,
+        help="Number of distinct arms presented in the episodic sequence.",
+    )
+    p.add_argument(
+        "--successor-delay-steps",
+        type=int,
+        default=5,
+        help="Center-delay frames between sequence encoding and query.",
+    )
+    p.add_argument(
+        "--successor-query-hold-steps",
+        type=int,
+        default=2,
+        help=(
+            "Number of repeated query-arm frames. Must be at least 2 so a "
+            "transition fast-weight model can form and then use the query state."
+        ),
+    )
+    p.add_argument(
+        "--transition-n-pairs",
+        type=int,
+        default=1,
+        help="Number of independently encoded source->target arm pairs.",
+    )
+    p.add_argument(
+        "--transition-delay-steps",
+        type=int,
+        default=0,
+        help="Center frames between pair encoding and the query.",
+    )
+    p.add_argument(
+        "--transition-query-hold-steps",
+        type=int,
+        default=2,
+        help="Repeated query frames; prediction is scored on the final frame.",
+    )
+    p.add_argument(
+        "--transition-reset-between-pairs",
+        action="store_true",
+        help=(
+            "Insert a hard neural-state scrub between encoded pairs while "
+            "preserving FastWave fast weights."
+        ),
+    )
+    p.add_argument(
+        "--transition-reset-before-query",
+        action="store_true",
+        help=(
+            "Scrub recurrent activity before the query while preserving "
+            "FastWave fast weights."
+        ),
+    )
     p.add_argument("--expose-visited-memory", action="store_true")
     p.add_argument(
         "--no-availability", dest="include_availability", action="store_false"
@@ -503,6 +692,27 @@ def parse_args():
             "'decay' applies F <- lambda F; 'hold' keeps F unchanged."
         ),
     )
+    p.add_argument(
+        "--fast-patch-norm",
+        choices=["none", "l2"],
+        default="none",
+        help=(
+            "Normalize FastWave local keys, queries, and values before "
+            "outer-product writing and retrieval. Use l2 for transition-memory "
+            "experiments; none preserves older checkpoint behavior."
+        ),
+    )
+    p.add_argument(
+        "--no-fast-readout-bias",
+        dest="fast_readout_bias",
+        action="store_false",
+        help=(
+            "Remove the bias from FastWave's retrieved-vector-to-site projection. "
+            "Recommended for testing whether behavior depends on Fq rather than "
+            "a constant learned fast-path drive."
+        ),
+    )
+    p.set_defaults(fast_readout_bias=True)
 
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-3)

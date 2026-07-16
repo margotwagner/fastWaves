@@ -1,102 +1,113 @@
-# Forced + reward-event FastWave writing
+# Normalized FastWave transition-memory update
 
-This update adds:
+This update addresses the transition-memory diagnostic in which the correct
+key/value direction was present but the retrieved signal was tiny and the
+`fast_to_site` bias dominated the fast pathway.
 
-```text
---fast-write-phase forced_reward
---fast-nonwrite-mode hold
-```
+## Changes
 
-The resulting schedule is:
+- Adds `--fast-patch-norm {none,l2}`.
+- Adds `--no-fast-readout-bias`.
+- With `l2`, FastWave uses normalized local patches for:
+  - the read query `q`,
+  - the transition key,
+  - the stored value.
+- Records both raw and normalized key/value patches.
+- Adds query-onset causal ablations:
+  - erase fast memory,
+  - shuffle fast memory across trials,
+  - disable the fast drive.
+- Uses new `*_norm_*` run names so old checkpoints are not reused.
 
-```text
-forced visits:       write
-settle:              hold
-choice traversal:    hold
-choice reward frame: write once
-return to center:    hold
-```
+Defaults preserve old checkpoint behavior (`none`, bias enabled). The new run
+scripts explicitly select `l2` and no bias.
 
-The reward gate uses the existing `cue_reward` input channel. No change to
-`tasks.py` is needed.
+## Install
 
-## Files to install
-
-```bash
-cp eight_arm_forced_reward_update/src/models.py src/models.py
-cp eight_arm_forced_reward_update/src/train.py src/train.py
-cp eight_arm_forced_reward_update/src/models_diagnostics.py src/models_diagnostics.py
-cp eight_arm_forced_reward_update/scripts/analyze_fastwave_states.py scripts/analyze_fastwave_states.py
-cp eight_arm_forced_reward_update/scripts/check_fast_write_gate.py scripts/check_fast_write_gate.py
-cp eight_arm_forced_reward_update/scripts/run_eight_arm_forced_reward_sweep.sh scripts/run_eight_arm_forced_reward_sweep.sh
-cp eight_arm_forced_reward_update/scripts/summarize_write_schedules.py scripts/summarize_write_schedules.py
-chmod +x scripts/check_fast_write_gate.py scripts/run_eight_arm_forced_reward_sweep.sh scripts/summarize_write_schedules.py
-```
-
-## Smoke test
+From the project root:
 
 ```bash
-python -m src.train \
-  --model fastwave \
-  --task eight_arm_bump_traj \
-  --choice-order random \
-  --choice-objective commitment \
-  --valid-choice-loss-weight 0.1 \
-  --wave-readout xv \
-  --action-hold-steps 1 \
-  --n-space 40 \
-  --seq-len 68 \
-  --n-arms 8 \
-  --arm-len 3 \
-  --reward-hold-steps 1 \
-  --settle-steps 5 \
-  --n-train 32 \
-  --n-val 16 \
-  --batch-size 16 \
-  --epochs 1 \
-  --routing-weight 50 \
-  --arm-choice-weight 50 \
-  --fast-update transition \
-  --fast-write-phase forced_reward \
-  --fast-nonwrite-mode hold \
-  --lam 0.95 \
-  --eta 0.10 \
-  --beta 0.25 \
-  --seed 42 \
-  --device cpu \
-  --run-name forced_reward_smoke
+unzip eight_arm_transition_memory_normalized_update.zip
+cp eight_arm_transition_memory_normalized_update/src/models.py src/models.py
+cp eight_arm_transition_memory_normalized_update/src/tasks.py src/tasks.py
+cp eight_arm_transition_memory_normalized_update/src/train.py src/train.py
+cp eight_arm_transition_memory_normalized_update/scripts/* scripts/
+chmod +x scripts/*.sh scripts/analyze_transition_*.py scripts/check_transition_tasks.py scripts/summarize_transition_recall.py
 ```
 
+## Check task construction
+
 ```bash
-python scripts/check_fast_write_gate.py \
-  --ckpt data/runs/forced_reward_smoke/best.pt \
-  --device cpu
+python scripts/check_transition_tasks.py
 ```
 
-The checker should report four choice-phase reward write events.
-
-## Three-seed experiment
+## Run the normalized two-arm sanity test
 
 ```bash
-DEVICE=cuda \
-EPOCHS=100 \
-N_TRAIN=2048 \
-N_VAL=256 \
-N_TEST=256 \
-BATCH_SIZE=64 \
-./scripts/run_eight_arm_forced_reward_sweep.sh
-```
-
-Restart while retaining completed runs:
-
-```bash
-DEVICE=cpu SKIP_EXISTING=1 \
-./scripts/run_eight_arm_forced_reward_sweep.sh
+DEVICE=cuda EPOCHS=100 N_TRAIN=2048 N_VAL=256 N_TEST=1024 \
+./scripts/run_two_arm_sanity.sh
 ```
 
 Outputs:
 
 ```text
-data/runs/write_schedule_run_level.csv
-data/runs/write_schedule_summary.csv
+data/runs/transition_sanity_norm_run_level.csv
+data/runs/transition_sanity_norm_summary.csv
+```
+
+## Run normalized independent transition pairs
+
+```bash
+DEVICE=cuda EPOCHS=100 N_TRAIN=4096 N_VAL=512 N_TEST=1024 \
+./scripts/run_independent_transition_pairs.sh
+```
+
+Outputs:
+
+```text
+data/runs/transition_independent_norm_run_level.csv
+data/runs/transition_independent_norm_summary.csv
+```
+
+FastWave runs also save:
+
+```text
+transition_ablations/metrics.csv
+```
+
+## Inspect one FastWave checkpoint
+
+```bash
+python scripts/analyze_transition_dynamics.py \
+  --ckpt data/runs/transition_independent_norm_fastwave_p3_d0_q2_seed42/best.pt \
+  --device cpu \
+  --trial 0
+```
+
+Key outputs:
+
+```text
+transition_dynamics/dynamics_trace.csv
+transition_dynamics/pair_similarity.csv
+transition_dynamics/key_and_retrieval_similarity.png
+transition_dynamics/fast_weight_progression.png
+transition_dynamics/summary.csv
+```
+
+## Hyperparameters
+
+The scripts start with:
+
+```text
+lambda = 1.0
+eta = 0.5
+beta = 0.25
+fast_patch_norm = l2
+fast_to_site bias = disabled
+```
+
+Override beta or eta through environment variables, for example:
+
+```bash
+BETA=0.10 ETA=0.50 DEVICE=cuda ./scripts/run_independent_transition_pairs.sh
 ```

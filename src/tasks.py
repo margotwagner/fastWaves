@@ -938,6 +938,536 @@ class EightArmBumpTrajectoryDataset(torch.utils.data.Dataset):
         )
 
 
+
+class EightArmSuccessorRecallDataset(torch.utils.data.Dataset):
+    """Trial-specific successor recall on an eight-arm radial maze.
+
+    A trial presents a random ordered sequence of distinct arms, waits through
+    a delay, then presents one nonterminal arm as a query. The model must report
+    the arm that followed the query in that episode.
+
+    The query is held for at least two timesteps. This is intentional: the first
+    query frame establishes a query-shaped recurrent state; on the next frame a
+    transition fast-weight model can use that state to retrieve the successor.
+
+    Channel layout matches ``EightArmBumpTrajectoryDataset``:
+      0:n_pos      radial-maze spatial bump
+      n_pos        encoding/forced cue (also the fast-write gate)
+      n_pos + 1    query cue
+      n_pos + 2    reward cue (unused here, retained for compatibility)
+      n_pos + 3    delay/settle cue
+      n_pos + 4    outbound cue (unused)
+      n_pos + 5    inbound cue (unused)
+      n_pos + 6    center cue
+      n_pos + 7 : n_pos + 7 + n_arms   eight-way successor output head
+
+    ``__getitem__`` returns five tensors:
+      x, y, loss_weights, successor_target, successor_query_mask
+    """
+
+    def __init__(
+        self,
+        n_samples: int = 2048,
+        seq_len: int | None = None,
+        n_space: int = 40,
+        n_arms: int = 8,
+        arm_len: int = 3,
+        successor_seq_length: int = 4,
+        successor_delay_steps: int = 5,
+        successor_query_hold_steps: int = 2,
+        bump_sigma: float = 0.75,
+        seed: int = 0,
+    ):
+        super().__init__()
+        if n_arms != 8:
+            raise ValueError("This implementation currently assumes n_arms=8.")
+        if arm_len < 2:
+            raise ValueError("arm_len must be at least 2.")
+        if not 2 <= successor_seq_length <= n_arms:
+            raise ValueError("successor_seq_length must be in [2, n_arms].")
+        if successor_delay_steps < 0:
+            raise ValueError("successor_delay_steps must be non-negative.")
+        if successor_query_hold_steps < 2:
+            raise ValueError(
+                "successor_query_hold_steps must be at least 2 so FastWave can "
+                "form a query state before reading the transition memory."
+            )
+        if bump_sigma <= 0:
+            raise ValueError("bump_sigma must be positive.")
+
+        self.n_samples = int(n_samples)
+        self.n_space = int(n_space)
+        self.n_arms = int(n_arms)
+        self.arm_len = int(arm_len)
+        self.successor_seq_length = int(successor_seq_length)
+        self.successor_delay_steps = int(successor_delay_steps)
+        self.successor_query_hold_steps = int(successor_query_hold_steps)
+        self.bump_sigma = float(bump_sigma)
+
+        self.center_idx = 0
+        self.n_pos = 1 + self.n_arms * self.arm_len
+        self.cue_forced = self.n_pos
+        self.cue_choice = self.n_pos + 1
+        self.cue_query = self.cue_choice
+        self.cue_reward = self.n_pos + 2
+        self.cue_settle = self.n_pos + 3
+        self.cue_outbound = self.n_pos + 4
+        self.cue_inbound = self.n_pos + 5
+        self.cue_center = self.n_pos + 6
+        self.arm_choice_start = self.n_pos + 7
+        self.arm_choice_end = self.arm_choice_start + self.n_arms
+        self.min_n_space = self.arm_choice_end
+        if self.n_space < self.min_n_space:
+            raise ValueError(
+                f"n_space={self.n_space} is too small; need at least "
+                f"{self.min_n_space}."
+            )
+
+        self.natural_seq_len = (
+            self.successor_seq_length
+            + self.successor_delay_steps
+            + self.successor_query_hold_steps
+        )
+        if seq_len is None:
+            seq_len = self.natural_seq_len
+        if seq_len < self.natural_seq_len:
+            raise ValueError(
+                f"seq_len={seq_len} is too short; need at least "
+                f"{self.natural_seq_len}."
+            )
+        self.seq_len = int(seq_len)
+        self.query_start = self.successor_seq_length + self.successor_delay_steps
+        self.successor_prediction_time = (
+            self.query_start + self.successor_query_hold_steps - 1
+        )
+
+        self.pos_dist = self._make_radial_graph_distance_matrix()
+        g = torch.Generator().manual_seed(seed)
+
+        xs = torch.zeros(self.n_samples, self.seq_len, self.n_space)
+        ys = torch.zeros_like(xs)
+        loss_weights = torch.zeros_like(xs)
+        successor_targets = torch.empty(self.n_samples, dtype=torch.long)
+        query_masks = torch.zeros(self.n_samples, self.seq_len, dtype=torch.bool)
+        sequences = torch.empty(
+            self.n_samples, self.successor_seq_length, dtype=torch.long
+        )
+        query_indices = torch.empty(self.n_samples, dtype=torch.long)
+        query_arms = torch.empty(self.n_samples, dtype=torch.long)
+
+        for i in range(self.n_samples):
+            sequence = torch.randperm(self.n_arms, generator=g)[
+                : self.successor_seq_length
+            ]
+            query_index = int(
+                torch.randint(
+                    0,
+                    self.successor_seq_length - 1,
+                    (1,),
+                    generator=g,
+                ).item()
+            )
+            query_arm = int(sequence[query_index].item())
+            successor = int(sequence[query_index + 1].item())
+
+            sequences[i] = sequence
+            query_indices[i] = query_index
+            query_arms[i] = query_arm
+            successor_targets[i] = successor
+
+            frames = []
+            for arm in sequence.tolist():
+                frames.append(self._arm_frame(arm, phase="forced"))
+            for _ in range(self.successor_delay_steps):
+                frames.append(self._center_frame(phase="settle"))
+            for _ in range(self.successor_query_hold_steps):
+                frames.append(self._arm_frame(query_arm, phase="query"))
+
+            while len(frames) < self.seq_len:
+                frames.append(self._center_frame(phase="settle"))
+
+            xs[i] = torch.stack(frames[: self.seq_len], dim=0)
+            ys[i, self.successor_prediction_time, self.arm_choice_start + successor] = 1.0
+            loss_weights[
+                i,
+                self.successor_prediction_time,
+                self.arm_choice_start : self.arm_choice_end,
+            ] = 1.0
+            query_masks[i, self.successor_prediction_time] = True
+
+        self.x = xs.float()
+        self.y = ys.float()
+        self.loss_weights = loss_weights.float()
+        self.successor_targets = successor_targets
+        self.successor_query_masks = query_masks
+        self.sequences = sequences
+        self.query_indices = query_indices
+        self.query_arms = query_arms
+
+    def arm_pos_idx(self, arm: int, depth: int) -> int:
+        return 1 + int(arm) * self.arm_len + int(depth)
+
+    def _pos_to_arm_depth(self, pos_idx: int):
+        if pos_idx == self.center_idx:
+            return -1, -1
+        z = pos_idx - 1
+        return z // self.arm_len, z % self.arm_len
+
+    def _make_radial_graph_distance_matrix(self) -> torch.Tensor:
+        distance = torch.zeros(self.n_pos, self.n_pos)
+        for i in range(self.n_pos):
+            ai, di = self._pos_to_arm_depth(i)
+            for j in range(self.n_pos):
+                aj, dj = self._pos_to_arm_depth(j)
+                if i == j:
+                    d = 0
+                elif i == self.center_idx:
+                    d = dj + 1
+                elif j == self.center_idx:
+                    d = di + 1
+                elif ai == aj:
+                    d = abs(di - dj)
+                else:
+                    d = (di + 1) + (dj + 1)
+                distance[i, j] = float(d)
+        return distance
+
+    def _position_bump(self, pos_idx: int) -> torch.Tensor:
+        d = self.pos_dist[pos_idx]
+        bump = torch.exp(-0.5 * (d / self.bump_sigma) ** 2)
+        return bump / bump.max().clamp_min(1e-8)
+
+    def _arm_frame(self, arm: int, phase: str) -> torch.Tensor:
+        frame = torch.zeros(self.n_space)
+        reward_pos = self.arm_pos_idx(arm, self.arm_len - 1)
+        frame[: self.n_pos] = self._position_bump(reward_pos)
+        if phase == "forced":
+            frame[self.cue_forced] = 1.0
+        elif phase == "query":
+            frame[self.cue_query] = 1.0
+        else:
+            raise ValueError(f"Unknown arm-frame phase: {phase}")
+        return frame
+
+    def _center_frame(self, phase: str) -> torch.Tensor:
+        frame = torch.zeros(self.n_space)
+        frame[: self.n_pos] = self._position_bump(self.center_idx)
+        if phase == "settle":
+            frame[self.cue_settle] = 1.0
+        else:
+            raise ValueError(f"Unknown center-frame phase: {phase}")
+        frame[self.cue_center] = 1.0
+        return frame
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        return (
+            self.x[idx],
+            self.y[idx],
+            self.loss_weights[idx],
+            self.successor_targets[idx],
+            self.successor_query_masks[idx],
+        )
+
+
+class EightArmTransitionRecallDataset(torch.utils.data.Dataset):
+    """One-shot arm-to-arm transition recall with optional activity scrubbing.
+
+    Each episode contains ``n_pairs`` randomly generated source->target pairs.
+    Every target frame carries a dedicated write cue. FastWave therefore writes
+    only after a source state has been established and the target arrives:
+
+        reset -> source A -> target B + WRITE
+
+    For the independent-pairs condition, a hard state-reset frame is inserted
+    between pairs and before the query. The reset erases neural activity in all
+    recurrent models, while FastWave retains its fast synaptic matrix. The
+    query arm is repeated; prediction is scored on the final query frame.
+
+    Channel layout (default n_space=40):
+      0:25    radial-maze bump channels
+      25      encoding cue
+      26      query cue
+      27      fast-write cue (active on each target frame)
+      28      hard state-reset cue
+      29      source cue
+      30      target cue
+      31      center cue
+      32:40   eight-way successor output head
+
+    ``__getitem__`` returns:
+      x, y, loss_weights, successor_target, successor_query_mask
+    """
+
+    def __init__(
+        self,
+        n_samples: int = 2048,
+        seq_len: int | None = None,
+        n_space: int = 40,
+        n_arms: int = 8,
+        arm_len: int = 3,
+        transition_n_pairs: int = 1,
+        transition_delay_steps: int = 0,
+        transition_query_hold_steps: int = 2,
+        transition_reset_between_pairs: bool = False,
+        transition_reset_before_query: bool = False,
+        bump_sigma: float = 0.75,
+        seed: int = 0,
+    ):
+        super().__init__()
+        if n_arms != 8:
+            raise ValueError("This implementation currently assumes n_arms=8.")
+        if arm_len < 2:
+            raise ValueError("arm_len must be at least 2.")
+        if not 1 <= transition_n_pairs <= n_arms // 2:
+            raise ValueError("transition_n_pairs must be in [1, n_arms // 2].")
+        if transition_delay_steps < 0:
+            raise ValueError("transition_delay_steps must be non-negative.")
+        if transition_query_hold_steps < 2:
+            raise ValueError(
+                "transition_query_hold_steps must be at least 2: the first "
+                "query frame creates the key state and the second reads F."
+            )
+        if bump_sigma <= 0:
+            raise ValueError("bump_sigma must be positive.")
+
+        self.n_samples = int(n_samples)
+        self.n_space = int(n_space)
+        self.n_arms = int(n_arms)
+        self.arm_len = int(arm_len)
+        self.transition_n_pairs = int(transition_n_pairs)
+        self.transition_delay_steps = int(transition_delay_steps)
+        self.transition_query_hold_steps = int(transition_query_hold_steps)
+        self.transition_reset_between_pairs = bool(transition_reset_between_pairs)
+        self.transition_reset_before_query = bool(transition_reset_before_query)
+        self.bump_sigma = float(bump_sigma)
+
+        self.center_idx = 0
+        self.n_pos = 1 + self.n_arms * self.arm_len
+        self.cue_encode = self.n_pos
+        self.cue_query = self.n_pos + 1
+        self.cue_write = self.n_pos + 2
+        self.cue_reset = self.n_pos + 3
+        self.cue_source = self.n_pos + 4
+        self.cue_target = self.n_pos + 5
+        self.cue_center = self.n_pos + 6
+        self.arm_choice_start = self.n_pos + 7
+        self.arm_choice_end = self.arm_choice_start + self.n_arms
+        self.min_n_space = self.arm_choice_end
+        if self.n_space < self.min_n_space:
+            raise ValueError(
+                f"n_space={self.n_space} is too small; need at least "
+                f"{self.min_n_space}."
+            )
+
+        # Generic hooks consumed by train.py/model constructors.
+        self.fast_write_cue = self.cue_write
+        self.cue_forced = self.cue_write  # backward-compatible alias
+        self.state_reset_cue = self.cue_reset
+
+        pair_frames = 2 * self.transition_n_pairs
+        between_resets = (
+            self.transition_n_pairs - 1
+            if self.transition_reset_between_pairs
+            else 0
+        )
+        query_reset = 1 if self.transition_reset_before_query else 0
+        self.natural_seq_len = (
+            pair_frames
+            + between_resets
+            + self.transition_delay_steps
+            + query_reset
+            + self.transition_query_hold_steps
+        )
+        if seq_len is None:
+            seq_len = self.natural_seq_len
+        if seq_len < self.natural_seq_len:
+            raise ValueError(
+                f"seq_len={seq_len} is too short; need at least "
+                f"{self.natural_seq_len}."
+            )
+        self.seq_len = int(seq_len)
+
+        self.pos_dist = self._make_radial_graph_distance_matrix()
+        g = torch.Generator().manual_seed(seed)
+
+        xs = torch.zeros(self.n_samples, self.seq_len, self.n_space)
+        ys = torch.zeros_like(xs)
+        loss_weights = torch.zeros_like(xs)
+        successor_targets = torch.empty(self.n_samples, dtype=torch.long)
+        query_masks = torch.zeros(self.n_samples, self.seq_len, dtype=torch.bool)
+
+        pair_sources = torch.empty(
+            self.n_samples, self.transition_n_pairs, dtype=torch.long
+        )
+        pair_targets = torch.empty_like(pair_sources)
+        pair_source_times = torch.empty_like(pair_sources)
+        pair_target_times = torch.empty_like(pair_sources)
+        queried_pair_indices = torch.empty(self.n_samples, dtype=torch.long)
+        query_arms = torch.empty(self.n_samples, dtype=torch.long)
+        query_start_times = torch.empty(self.n_samples, dtype=torch.long)
+        prediction_times = torch.empty(self.n_samples, dtype=torch.long)
+
+        for i in range(self.n_samples):
+            # Distinct arms make the first sanity and independent-pair tasks
+            # unambiguous and prevent duplicate keys or values within a trial.
+            perm = torch.randperm(self.n_arms, generator=g)[
+                : 2 * self.transition_n_pairs
+            ]
+            sources = perm[0::2]
+            targets = perm[1::2]
+            query_pair = int(
+                torch.randint(
+                    0, self.transition_n_pairs, (1,), generator=g
+                ).item()
+            )
+            query_arm = int(sources[query_pair].item())
+            successor = int(targets[query_pair].item())
+
+            pair_sources[i] = sources
+            pair_targets[i] = targets
+            queried_pair_indices[i] = query_pair
+            query_arms[i] = query_arm
+            successor_targets[i] = successor
+
+            frames: list[torch.Tensor] = []
+            source_times = []
+            target_times = []
+            for pair_idx, (source, target) in enumerate(
+                zip(sources.tolist(), targets.tolist())
+            ):
+                if pair_idx > 0 and self.transition_reset_between_pairs:
+                    frames.append(self._reset_frame())
+                source_times.append(len(frames))
+                frames.append(self._arm_frame(source, phase="source"))
+                target_times.append(len(frames))
+                frames.append(self._arm_frame(target, phase="target"))
+
+            for _ in range(self.transition_delay_steps):
+                frames.append(self._center_frame())
+
+            if self.transition_reset_before_query:
+                frames.append(self._reset_frame())
+
+            query_start = len(frames)
+            for _ in range(self.transition_query_hold_steps):
+                frames.append(self._arm_frame(query_arm, phase="query"))
+            prediction_time = len(frames) - 1
+
+            while len(frames) < self.seq_len:
+                frames.append(self._center_frame())
+
+            xs[i] = torch.stack(frames[: self.seq_len], dim=0)
+            ys[i, prediction_time, self.arm_choice_start + successor] = 1.0
+            loss_weights[
+                i,
+                prediction_time,
+                self.arm_choice_start : self.arm_choice_end,
+            ] = 1.0
+            query_masks[i, prediction_time] = True
+
+            pair_source_times[i] = torch.tensor(source_times)
+            pair_target_times[i] = torch.tensor(target_times)
+            query_start_times[i] = query_start
+            prediction_times[i] = prediction_time
+
+        self.x = xs.float()
+        self.y = ys.float()
+        self.loss_weights = loss_weights.float()
+        self.successor_targets = successor_targets
+        self.successor_query_masks = query_masks
+        self.pair_sources = pair_sources
+        self.pair_targets = pair_targets
+        self.pair_source_times = pair_source_times
+        self.pair_target_times = pair_target_times
+        self.queried_pair_indices = queried_pair_indices
+        self.query_arms = query_arms
+        self.query_start_times = query_start_times
+        self.prediction_times = prediction_times
+
+        # Scalar aliases are convenient because all trials share the same timing.
+        self.query_start = int(query_start_times[0].item())
+        self.successor_prediction_time = int(prediction_times[0].item())
+
+    def arm_pos_idx(self, arm: int, depth: int) -> int:
+        return 1 + int(arm) * self.arm_len + int(depth)
+
+    def _pos_to_arm_depth(self, pos_idx: int):
+        if pos_idx == self.center_idx:
+            return -1, -1
+        z = pos_idx - 1
+        return z // self.arm_len, z % self.arm_len
+
+    def _make_radial_graph_distance_matrix(self) -> torch.Tensor:
+        distance = torch.zeros(self.n_pos, self.n_pos)
+        for i in range(self.n_pos):
+            ai, di = self._pos_to_arm_depth(i)
+            for j in range(self.n_pos):
+                aj, dj = self._pos_to_arm_depth(j)
+                if i == j:
+                    d = 0
+                elif i == self.center_idx:
+                    d = dj + 1
+                elif j == self.center_idx:
+                    d = di + 1
+                elif ai == aj:
+                    d = abs(di - dj)
+                else:
+                    d = (di + 1) + (dj + 1)
+                distance[i, j] = float(d)
+        return distance
+
+    def _position_bump(self, pos_idx: int) -> torch.Tensor:
+        d = self.pos_dist[pos_idx]
+        bump = torch.exp(-0.5 * (d / self.bump_sigma) ** 2)
+        return bump / bump.max().clamp_min(1e-8)
+
+    def _arm_frame(self, arm: int, phase: str) -> torch.Tensor:
+        frame = torch.zeros(self.n_space)
+        reward_pos = self.arm_pos_idx(arm, self.arm_len - 1)
+        frame[: self.n_pos] = self._position_bump(reward_pos)
+        if phase in {"source", "query"}:
+            # Source and query frames are deliberately identical. After a hard
+            # state reset, the isolated source arm therefore recreates the same
+            # fast-weight key at encoding and retrieval time.
+            frame[self.cue_query] = 1.0
+            frame[self.cue_source] = 1.0
+        elif phase == "target":
+            frame[self.cue_target] = 1.0
+            frame[self.cue_write] = 1.0
+        else:
+            raise ValueError(f"Unknown arm-frame phase: {phase}")
+        return frame
+
+    def _center_frame(self) -> torch.Tensor:
+        frame = torch.zeros(self.n_space)
+        frame[: self.n_pos] = self._position_bump(self.center_idx)
+        frame[self.cue_center] = 1.0
+        return frame
+
+    def _reset_frame(self) -> torch.Tensor:
+        frame = torch.zeros(self.n_space)
+        frame[self.cue_reset] = 1.0
+        return frame
+
+    def query_frame(self, arm: int) -> torch.Tensor:
+        """Public helper used by diagnostic query sweeps."""
+        return self._arm_frame(int(arm), phase="query")
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        return (
+            self.x[idx],
+            self.y[idx],
+            self.loss_weights[idx],
+            self.successor_targets[idx],
+            self.successor_query_masks[idx],
+        )
+
 def build_dataset(args, n_samples, seed):
     if args.task == "ring":
         return RingBumpDataset(
@@ -1004,6 +1534,46 @@ def build_dataset(args, n_samples, seed):
             choice_departure_weight=getattr(args, "choice_departure_weight", 10.0),
             arm_choice_weight=getattr(args, "arm_choice_weight", 50.0),
             routing_weight=getattr(args, "routing_weight", 20.0),
+            seed=seed,
+        )
+
+
+    if args.task == "eight_arm_successor":
+        return EightArmSuccessorRecallDataset(
+            n_samples=n_samples,
+            seq_len=args.seq_len,
+            n_space=args.n_space,
+            n_arms=getattr(args, "n_arms", 8),
+            arm_len=getattr(args, "arm_len", 3),
+            successor_seq_length=getattr(args, "successor_seq_length", 4),
+            successor_delay_steps=getattr(args, "successor_delay_steps", 5),
+            successor_query_hold_steps=getattr(
+                args, "successor_query_hold_steps", 2
+            ),
+            bump_sigma=getattr(args, "bump_sigma", 0.75),
+            seed=seed,
+        )
+
+
+    if args.task == "eight_arm_transition_recall":
+        return EightArmTransitionRecallDataset(
+            n_samples=n_samples,
+            seq_len=args.seq_len,
+            n_space=args.n_space,
+            n_arms=getattr(args, "n_arms", 8),
+            arm_len=getattr(args, "arm_len", 3),
+            transition_n_pairs=getattr(args, "transition_n_pairs", 1),
+            transition_delay_steps=getattr(args, "transition_delay_steps", 0),
+            transition_query_hold_steps=getattr(
+                args, "transition_query_hold_steps", 2
+            ),
+            transition_reset_between_pairs=getattr(
+                args, "transition_reset_between_pairs", False
+            ),
+            transition_reset_before_query=getattr(
+                args, "transition_reset_before_query", False
+            ),
+            bump_sigma=getattr(args, "bump_sigma", 0.75),
             seed=seed,
         )
 
